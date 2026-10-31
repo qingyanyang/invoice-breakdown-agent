@@ -1,0 +1,17 @@
+# Generated ARM templates from `az bicep build`
+infra/**/*.json
+
+# Local / tooling
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Python / Node (future app scaffolds)
+**/__pycache__/
+**/.venv/
+**/node_modules/
+**/dist/
+**/.pytest_cache/
+**/.mypy_cache/
+**/coverage/

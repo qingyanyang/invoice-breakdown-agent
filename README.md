@@ -141,14 +141,34 @@ docs/           # Architecture, retrieval experiments, evaluation
 
 A future `.env.example` will document configuration without including secrets. The local environment will use Dockerized PostgreSQL with pgvector.
 
-## CI/CD and deployment (planned)
+## CI/CD and deployment
 
-- **Pull requests:** Python lint/type checks/tests; frontend checks/build; Bicep validation.
-- **Main branch:** deploy React and FastAPI; run controlled Alembic migrations and smoke tests.
-- **Hosting:** Azure Static Web Apps, Azure Container Apps, Azure Database for PostgreSQL, Azure Blob Storage.
-- **Evaluation:** fast deterministic checks in CI; paid model-based evaluation as a separately triggered workflow.
+**Single Azure environment:** public portfolio **demo** only (no separate Azure staging/production yet).
 
-**Live demo:** Coming soon. A bounded demo corpus and query limits will be provided to manage cost and protect the service.
+```text
+Local Development → Pull Request CI → Merge to Main → Azure Demo
+```
+
+| Layer | Detail |
+| --- | --- |
+| Azure resource group | `rg-knowledge-intelligence-demo` |
+| Bicep parameters | [`infra/parameters/demo.bicepparam`](infra/parameters/demo.bicepparam) |
+| GitHub Environment | `demo` |
+| Bicep `environment` / tags | `demo` (modules stay reusable for future `staging` / `production` param files) |
+
+Infrastructure as Code: [`infra/`](infra/). Full ops guide: **[`infra/README.md`](infra/README.md)** (pgvector, UAMI/AcrPull, secrets, OIDC).
+
+| Workflow | Purpose |
+| --- | --- |
+| `.github/workflows/infra-ci.yml` | Bicep build/lint on `infra/**` (PR / push) |
+| `.github/workflows/infra-cd.yml` | Manual infra deploy + LLM secret restore (Environment `demo`) |
+| `.github/workflows/backend-cd.yml` | ACR build + Container App update (skips until `backend/Dockerfile`) |
+| `.github/workflows/frontend-cd.yml` | SWA deploy (skips until `frontend/package.json`) |
+
+- **Hosting (planned live):** Static Web Apps (`eastasia`), Container Apps + PostgreSQL/pgvector + Blob (`australiasoutheast`).
+- Independent of Enterprise AI Agent Platform (`rg-knowledge-intelligence-demo` only).
+
+**Live demo:** Coming soon. Public demo will use synthetic corpora, rate limits, and LLM usage caps (see `infra/README.md`). Do not create Azure resources until an explicit deploy is approved.
 
 ## Documentation
 

@@ -1,0 +1,103 @@
+name: Backend CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-cd.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: backend-cd-demo
+  cancel-in-progress: true
+
+env:
+  RESOURCE_GROUP: rg-knowledge-intelligence-demo
+  CONTAINER_APP_NAME: ${{ vars.CONTAINER_APP_NAME }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  IMAGE_REPOSITORY: knowledge-intelligence-api
+
+jobs:
+  build-and-deploy:
+    name: Build, push, update Container App
+    runs-on: ubuntu-latest
+    environment: demo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require backend Dockerfile
+        id: gate
+        run: |
+          if [ ! -f backend/Dockerfile ]; then
+            echo "backend/Dockerfile not found. Skipping backend CD until the FastAPI app is scaffolded."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate required variables
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          if [ -z "${{ env.ACR_NAME }}" ] || [ -z "${{ env.CONTAINER_APP_NAME }}" ]; then
+            echo "Set Environment variables ACR_NAME and CONTAINER_APP_NAME (from infra outputs) before backend CD."
+            echo "Phase 2 (deployContainerApp=true) must complete before image updates succeed."
+            exit 1
+          fi
+
+      - name: Azure Login (OIDC)
+        if: steps.gate.outputs.skip != 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push image to ACR
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          LOGIN_SERVER="$(az acr show -n "${{ env.ACR_NAME }}" --query loginServer -o tsv)"
+          IMAGE="${LOGIN_SERVER}/${{ env.IMAGE_REPOSITORY }}:${{ github.sha }}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          az acr build \
+            --registry "${{ env.ACR_NAME }}" \
+            --image "${{ env.IMAGE_REPOSITORY }}:${{ github.sha }}" \
+            --image "${{ env.IMAGE_REPOSITORY }}:latest" \
+            backend
+
+      # Secrets (postgres-password, llm-api-key) are IaC-owned via Bicep Option A.
+      # backend-cd only updates the image — do not CLI-set secrets here (fights Bicep replace-semantics).
+      - name: Update Container App image
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --name "${{ env.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --image "${{ env.IMAGE }}"
+
+      - name: Health check smoke test
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          FQDN="$(az containerapp show \
+            --name "${{ env.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)"
+          echo "Checking https://${FQDN}/health"
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS "https://${FQDN}/health"; then
+              echo "Health check passed."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
