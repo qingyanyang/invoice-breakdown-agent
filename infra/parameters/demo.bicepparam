@@ -30,7 +30,7 @@ param postgresSchema = 'knowledge_intelligence'
 // Phase 1: false — no Container App until a public GHCR image exists.
 // Phase 2: set true + containerImage = 'ghcr.io/qingyanyang/knowledge-intelligence-api:latest'
 param deployContainerApp = true
-param containerImage = ''
+param containerImage = 'ghcr.io/qingyanyang/knowledge-intelligence-api:latest'
 
 param containerCpu = '0.25'
 param containerMemory = '0.5Gi'
