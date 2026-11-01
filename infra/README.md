@@ -64,8 +64,8 @@ flowchart LR
 | --- | --- |
 | Log Analytics | PerGB2018 |
 | Application Insights | Workspace-based |
-| Storage Account | `documents` / `processed-documents`; shared keys disabled; UAMI + RBAC |
-| User-assigned managed identity | Blob Data Contributor (Phase 2) |
+| Storage Account | `documents` / `processed-documents`; shared keys disabled |
+| User-assigned managed identity | Attached to Container App; Blob Data Contributor assigned **manually** (see below) |
 | Container Apps Environment | Consumption |
 | Container App | Optional (`deployContainerApp`); public GHCR image; probes `/health` |
 | Static Web Apps | Free; `eastasia` |
@@ -98,10 +98,24 @@ The Container App is **not** created in Phase 1. To provision it:
 
 4. Set GitHub Environment `demo` secret `DATABASE_URL` (Supabase session pooler). `LLM_API_KEY` is optional.
 5. Redeploy infra (`infra-cd` with `confirm_destructive=DEPLOY`, or `bash scripts/infra/deploy.sh`).
-6. From deployment outputs, set GitHub vars:
+6. **Once (Owner login):** grant the UAMI Blob access (Bicep does not create role assignments — GitHub OIDC is Contributor-only):
+
+   ```bash
+   RG=rg-knowledge-intelligence-demo
+   UAMI_PRINCIPAL_ID=$(az identity show -g "$RG" -n eki-demo-uami --query principalId -o tsv)
+   STORAGE=$(az storage account list -g "$RG" --query "[0].name" -o tsv)
+
+   az role assignment create \
+     --assignee-object-id "$UAMI_PRINCIPAL_ID" \
+     --assignee-principal-type ServicePrincipal \
+     --role "Storage Blob Data Contributor" \
+     --scope "$(az storage account show -g "$RG" -n "$STORAGE" --query id -o tsv)"
+   ```
+
+7. From deployment outputs, set GitHub vars:
    - `CONTAINER_APP_NAME` (e.g. `eki-demo-api`)
    - `VITE_API_BASE_URL` = Container App URL
-7. Copy SWA deployment token → secret `AZURE_STATIC_WEB_APPS_API_TOKEN`, then run `frontend-cd`.
+8. Copy SWA deployment token → secret `AZURE_STATIC_WEB_APPS_API_TOKEN`, then run `frontend-cd`.
 
 ---
 
@@ -219,7 +233,7 @@ infra/
     app-insights.bicep
     container-app.bicep
     container-app-env.bicep
-    identity-rbac.bicep      # Blob only (no AcrPull)
+    identity-rbac.bicep      # unused by main (manual Blob RBAC; kept for reference)
     log-analytics.bicep
     managed-identity.bicep
     static-web-app.bicep
@@ -232,4 +246,5 @@ infra/
 ```
 
 **Deleted modules (obsolete):** `postgresql.bicep`, `container-registry.bicep`  
-**Deleted scripts (obsolete):** `create-postgres-app-user.*`, `grant-postgres-app-user-dml.*`
+**Deleted scripts (obsolete):** `create-postgres-app-user.*`, `grant-postgres-app-user-dml.*`  
+**Not wired from `main.bicep`:** `identity-rbac` (role assignments require Owner / User Access Administrator; assign Blob Data Contributor manually after Phase 2).

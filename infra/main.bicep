@@ -113,18 +113,9 @@ module managedIdentity 'modules/managed-identity.bicep' = {
   }
 }
 
-// Blob Data Contributor on UAMI when Container App is deployed (no ACR / AcrPull).
-module identityRbac 'modules/identity-rbac.bicep' = {
-  name: 'identity-rbac'
-  params: {
-    uamiPrincipalId: managedIdentity.outputs.principalId
-    roleAssignmentNamePrefix: uamiName
-    storageAccountName: storage.outputs.name
-    assignBlobDataContributor: deployContainerApp
-  }
-}
-
 // Depends on LAW via customerId + primarySharedKey outputs.
+// Blob Data Contributor for the UAMI is assigned manually (GitHub OIDC SP is Contributor-only
+// and cannot create role assignments). See infra/README.md.
 module containerAppEnv 'modules/container-app-env.bicep' = {
   name: 'container-app-env'
   params: {
@@ -170,9 +161,6 @@ module containerApp 'modules/container-app.bicep' = if (deployContainerApp) {
     corsAllowedOrigins: corsOriginsCsv
     tags: commonTags
   }
-  dependsOn: [
-    identityRbac
-  ]
 }
 
 output resourceGroupName string = resourceGroup().name
