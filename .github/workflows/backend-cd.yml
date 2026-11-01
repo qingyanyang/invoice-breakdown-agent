@@ -7,7 +7,13 @@ on:
     paths:
       - "backend/**"
       - ".github/workflows/backend-cd.yml"
+
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to Azure Container Apps (disable for initial GHCR image build)"
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -21,90 +27,141 @@ concurrency:
 env:
   RESOURCE_GROUP: rg-knowledge-intelligence-demo
   CONTAINER_APP_NAME: ${{ vars.CONTAINER_APP_NAME }}
-  # Public GHCR image: ghcr.io/<owner>/<IMAGE_NAME>:<tag>
   IMAGE_NAME: knowledge-intelligence-api
 
 jobs:
   build-and-deploy:
-    name: Build, push GHCR, update Container App
+    name: Build, publish GHCR, deploy Container App
     runs-on: ubuntu-latest
     environment: demo
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Require backend Dockerfile
-        id: gate
+      - name: Validate Dockerfile
         run: |
-          if [ ! -f backend/Dockerfile ]; then
-            echo "backend/Dockerfile not found. Skipping backend CD until the FastAPI app is scaffolded."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
 
-      - name: Validate required variables
-        if: steps.gate.outputs.skip != 'true'
-        run: |
-          if [ -z "${{ env.CONTAINER_APP_NAME }}" ]; then
-            echo "Set Environment variable CONTAINER_APP_NAME (from infra outputs) before backend CD."
+          if [ ! -f backend/Dockerfile ]; then
+            echo "ERROR: backend/Dockerfile not found."
             exit 1
           fi
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare image names
+        run: |
+          set -euo pipefail
+
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}:${GITHUB_SHA}"
+          IMAGE_LATEST="ghcr.io/${OWNER}/${IMAGE_NAME}:latest"
+
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          echo "IMAGE_LATEST=${IMAGE_LATEST}" >> "$GITHUB_ENV"
+
       - name: Log in to GHCR
-        if: steps.gate.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push public image to GHCR
-        if: steps.gate.outputs.skip != 'true'
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}
+            ${{ env.IMAGE_LATEST }}
+
+      - name: Determine deployment mode
+        id: deployment
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DEPLOY_INPUT: ${{ inputs.deploy }}
         run: |
           set -euo pipefail
-          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          IMAGE="ghcr.io/${OWNER}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          IMAGE_LATEST="ghcr.io/${OWNER}/${{ env.IMAGE_NAME }}:latest"
-          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
-          docker build -t "${IMAGE}" -t "${IMAGE_LATEST}" backend
-          docker push "${IMAGE}"
-          docker push "${IMAGE_LATEST}"
-          echo "Ensure the GHCR package visibility is Public so Azure Container Apps can pull without credentials."
+
+          # Push to main always attempts Azure deploy (needs CONTAINER_APP_NAME).
+          # Manual run defaults deploy=false so the first public GHCR image can publish alone.
+          if [ "$EVENT_NAME" = "push" ] || [ "$DEPLOY_INPUT" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Image published. Azure deployment skipped."
+          fi
+
+      - name: Validate Azure configuration
+        if: steps.deployment.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+
+          if [ -z "$CONTAINER_APP_NAME" ]; then
+            echo "ERROR: Set CONTAINER_APP_NAME in GitHub Environment 'demo' (from infra outputs)."
+            echo "For initial image-only publish, use workflow_dispatch with deploy=false."
+            exit 1
+          fi
 
       - name: Azure Login (OIDC)
-        if: steps.gate.outputs.skip != 'true'
+        if: steps.deployment.outputs.enabled == 'true'
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Secrets (database-url, llm-api-key) are IaC-owned via Bicep Option A.
       - name: Update Container App image
-        if: steps.gate.outputs.skip != 'true'
+        if: steps.deployment.outputs.enabled == 'true'
         run: |
           set -euo pipefail
+
+          az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output none
+
           az containerapp update \
-            --name "${{ env.CONTAINER_APP_NAME }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --image "${{ env.IMAGE }}"
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$IMAGE"
 
       - name: Health check smoke test
-        if: steps.gate.outputs.skip != 'true'
+        if: steps.deployment.outputs.enabled == 'true'
         run: |
           set -euo pipefail
+
           FQDN="$(az containerapp show \
-            --name "${{ env.CONTAINER_APP_NAME }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query properties.configuration.ingress.fqdn -o tsv)"
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            -o tsv)"
+
+          if [ -z "$FQDN" ]; then
+            echo "ERROR: Container App FQDN not found."
+            exit 1
+          fi
+
           echo "Checking https://${FQDN}/health"
-          for i in 1 2 3 4 5 6; do
-            if curl -fsS "https://${FQDN}/health"; then
+
+          for i in $(seq 1 12); do
+            if curl --fail --silent --show-error \
+              --max-time 10 \
+              "https://${FQDN}/health"; then
+              echo ""
               echo "Health check passed."
               exit 0
             fi
+
+            echo "Attempt $i failed. Retrying..."
             sleep 10
           done
-          echo "Health check failed after retries."
+
+          echo "ERROR: Health check failed."
           exit 1
