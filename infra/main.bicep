@@ -30,10 +30,10 @@ param enableLlmApiKey bool = false
 param postgresSchema string = 'knowledge_intelligence'
 
 @description('When false (Phase 1), skip Container App until a public GHCR image exists.')
-param deployContainerApp bool = false
+param deployContainerApp bool = true
 
 @description('Full public image reference, e.g. ghcr.io/<github-username>/knowledge-intelligence-api:<tag>. Required when deployContainerApp is true. No registry credentials (public pull).')
-param containerImage string = ''
+param containerImage string = 'ghcr.io/qingyanyang/knowledge-intelligence-api:latest'
 
 @description('Container CPU cores.')
 param containerCpu string = '0.25'
