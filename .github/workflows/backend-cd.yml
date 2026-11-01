@@ -89,24 +89,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Push to main always attempts Azure deploy (needs CONTAINER_APP_NAME).
-          # Manual run defaults deploy=false so the first public GHCR image can publish alone.
-          if [ "$EVENT_NAME" = "push" ] || [ "$DEPLOY_INPUT" = "true" ]; then
+          # Azure deploy when:
+          # - push to main AND CONTAINER_APP_NAME is set, or
+          # - workflow_dispatch with deploy=true (CONTAINER_APP_NAME required below)
+          # Otherwise publish GHCR image only (Phase 1 / first image).
+          want_deploy=false
+          if [ "$EVENT_NAME" = "push" ]; then
+            want_deploy=true
+          elif [ "$DEPLOY_INPUT" = "true" ]; then
+            want_deploy=true
+          fi
+
+          if [ "$want_deploy" = "true" ] && [ -n "${CONTAINER_APP_NAME:-}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Azure deployment enabled (CONTAINER_APP_NAME=${CONTAINER_APP_NAME})."
+          elif [ "$want_deploy" = "true" ] && [ -z "${CONTAINER_APP_NAME:-}" ]; then
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "ERROR: deploy=true but CONTAINER_APP_NAME is not set in Environment 'demo'."
+              exit 1
+            fi
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "CONTAINER_APP_NAME unset — image published; Azure deploy skipped (set the var after Phase 2)."
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "Image published. Azure deployment skipped."
-          fi
-
-      - name: Validate Azure configuration
-        if: steps.deployment.outputs.enabled == 'true'
-        run: |
-          set -euo pipefail
-
-          if [ -z "$CONTAINER_APP_NAME" ]; then
-            echo "ERROR: Set CONTAINER_APP_NAME in GitHub Environment 'demo' (from infra outputs)."
-            echo "For initial image-only publish, use workflow_dispatch with deploy=false."
-            exit 1
           fi
 
       - name: Azure Login (OIDC)
