@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Fail fast when dual-path secrets are missing before az deployment group create.
+# Validate required deployment configuration.
 #
-# Usage (local):
-#   ./infra/scripts/validate-deploy-secrets.sh infra/parameters/demo.bicepparam
+# Phase 1 (deployContainerApp=false):
+#   No application secrets required.
 #
-# Empty defaults in .bicepparam are for CI parse/what-if evaluation only —
-# this script is the gate that prevents an accidental empty-secret deploy.
-# Option A: when the Container App is deployed, LLM_API_KEY is required (IaC-owned).
+# Phase 2 (deployContainerApp=true):
+#   DATABASE_URL and containerImage are required.
+#   LLM_API_KEY is optional.
 
 set -euo pipefail
 
 PARAM_FILE="${1:-infra/parameters/demo.bicepparam}"
 
-if [[ ! -f "${PARAM_FILE}" ]]; then
-  echo "Parameter file not found: ${PARAM_FILE}" >&2
+if [[ ! -f "$PARAM_FILE" ]]; then
+  echo "ERROR: Parameter file not found: $PARAM_FILE" >&2
   exit 1
 fi
 
@@ -22,31 +22,48 @@ missing=0
 require_nonempty() {
   local name="$1"
   local value="${!name:-}"
-  if [[ -z "${value}" ]]; then
-    echo "Missing required secret/env: ${name}" >&2
+
+  if [[ -z "$value" ]]; then
+    echo "ERROR: Missing required secret/env: $name" >&2
     missing=1
   fi
 }
 
-require_nonempty POSTGRES_ADMIN_PASSWORD
-
+# Determine whether Container App deployment is enabled.
 deploy_ca=false
-if grep -Eq '^[[:space:]]*param[[:space:]]+deployContainerApp[[:space:]]*=[[:space:]]*true[[:space:]]*$' "${PARAM_FILE}"; then
+
+if grep -Eq \
+  '^[[:space:]]*param[[:space:]]+deployContainerApp[[:space:]]*=[[:space:]]*true[[:space:]]*(//.*)?$' \
+  "$PARAM_FILE"; then
   deploy_ca=true
 fi
 
-if [[ "${deploy_ca}" == "true" ]]; then
-  require_nonempty POSTGRES_APP_PASSWORD
-  require_nonempty LLM_API_KEY
-  if ! grep -Eq '^[[:space:]]*param[[:space:]]+containerImage[[:space:]]*=[[:space:]]*'\''[^'\'']+'\''' "${PARAM_FILE}"; then
-    echo "deployContainerApp is true but containerImage looks empty in ${PARAM_FILE}" >&2
+if [[ "$deploy_ca" == "true" ]]; then
+
+  echo "Container App deployment enabled."
+
+  # Required: Supabase PostgreSQL connection string
+  require_nonempty DATABASE_URL
+
+  # Required: Docker image
+  if ! grep -Eq \
+    "^[[:space:]]*param[[:space:]]+containerImage[[:space:]]*=[[:space:]]*'[^']+'[[:space:]]*(//.*)?$" \
+    "$PARAM_FILE"; then
+
+    echo "ERROR: containerImage is missing or empty in $PARAM_FILE" >&2
     missing=1
   fi
+
+  # Optional: LLM_API_KEY
+  # No validation required until LLM integration is implemented.
+
+else
+  echo "Container App deployment disabled."
 fi
 
-if [[ "${missing}" -ne 0 ]]; then
-  echo "Refusing to deploy with incomplete secrets (deployContainerApp=${deploy_ca})." >&2
+if [[ "$missing" -ne 0 ]]; then
+  echo "ERROR: Deployment validation failed (deployContainerApp=$deploy_ca)." >&2
   exit 1
 fi
 
-echo "Deploy secrets OK (deployContainerApp=${deploy_ca})."
+echo "Deployment validation passed (deployContainerApp=$deploy_ca)."

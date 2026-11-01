@@ -35,7 +35,7 @@ flowchart TD
     INGEST --> PARSE[Parsing and normalization]
     PARSE --> CHUNK[Chunking + provenance]
     CHUNK --> EMBED[Embedding generation]
-    EMBED --> DB[(Azure PostgreSQL + pgvector)]
+    EMBED --> DB[(Supabase PostgreSQL + pgvector)]
     API --> QUERY[Query pipeline]
     QUERY --> FILTER[Authorization-aware filtering]
     FILTER --> HYBRID[Vector + full-text retrieval]
@@ -59,12 +59,12 @@ flowchart TD
 | Reranking | Model/provider to be selected and benchmarked |
 | Embeddings / generation | Model/provider to be selected |
 | Data access | SQLAlchemy 2.x, Alembic |
-| Database | Azure Database for PostgreSQL with pgvector |
+| Database | Supabase PostgreSQL + pgvector (schema `knowledge_intelligence`) |
 | Parsing | PyMuPDF, python-docx if DOCX support is added, language-aware text parsing |
 | File storage | Azure Blob Storage |
 | Testing | pytest, Vitest |
 | Quality | Ruff, mypy, ESLint, TypeScript |
-| Infrastructure | Docker, Azure Container Apps, Azure Static Web Apps, Bicep |
+| Infrastructure | Docker, Azure Container Apps, Azure Static Web Apps, Bicep; images on public GHCR |
 | CI/CD | GitHub Actions |
 
 The project will implement core retrieval steps explicitly before deciding whether a framework such as LlamaIndex or LangChain adds enough value.
@@ -127,19 +127,40 @@ Baselines will compare **keyword search**, **vector-only search**, and **hybrid 
 
 ## Local development
 
-> **Not available yet.** Verified setup instructions will be added after the initial application scaffold is committed.
-
-Expected layout:
-
 ```text
-frontend/       # React + TypeScript
-backend/        # FastAPI, ingestion and retrieval pipelines
+frontend/       # React + TypeScript (Vite)
+backend/        # FastAPI API scaffold
 infra/          # Azure Bicep modules and parameters
 docs/           # Architecture, retrieval experiments, evaluation
 .github/        # CI/CD workflows
 ```
 
-A future `.env.example` will document configuration without including secrets. The local environment will use Dockerized PostgreSQL with pgvector.
+### Backend
+
+```bash
+cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+uvicorn app.main:app --reload --port 8000
+```
+
+See [`backend/README.md`](backend/README.md).
+
+### Frontend
+
+```bash
+cd frontend
+cp .env.example .env
+npm install
+npm run dev
+```
+
+See [`frontend/README.md`](frontend/README.md).
+
+### Container App (Azure)
+
+Phase 1 infra does **not** create the Container App. After a public GHCR image exists, set `deployContainerApp = true` + `containerImage` in [`infra/parameters/demo.bicepparam`](infra/parameters/demo.bicepparam) and redeploy. Full steps: [`infra/README.md`](infra/README.md).
 
 ## CI/CD and deployment
 
@@ -156,16 +177,16 @@ Local Development → Pull Request CI → Merge to Main → Azure Demo
 | GitHub Environment | `demo` |
 | Bicep `environment` / tags | `demo` (modules stay reusable for future `staging` / `production` param files) |
 
-Infrastructure as Code: [`infra/`](infra/). Full ops guide: **[`infra/README.md`](infra/README.md)** (pgvector, UAMI/AcrPull, secrets, OIDC).
+Infrastructure as Code: [`infra/`](infra/). Full ops guide: **[`infra/README.md`](infra/README.md)** (Supabase/pgvector, GHCR, secrets, OIDC).
 
 | Workflow | Purpose |
 | --- | --- |
 | `.github/workflows/infra-ci.yml` | Bicep build/lint on `infra/**` (PR / push) |
-| `.github/workflows/infra-cd.yml` | Manual infra deploy + LLM secret restore (Environment `demo`) |
-| `.github/workflows/backend-cd.yml` | ACR build + Container App update (skips until `backend/Dockerfile`) |
-| `.github/workflows/frontend-cd.yml` | SWA deploy (skips until `frontend/package.json`) |
+| `.github/workflows/infra-cd.yml` | Manual infra deploy to Environment `demo` (`DATABASE_URL`; optional `LLM_API_KEY`) |
+| `.github/workflows/backend-cd.yml` | GHCR build/push + Container App image update |
+| `.github/workflows/frontend-cd.yml` | SWA deploy |
 
-- **Hosting (planned live):** Static Web Apps (`eastasia`), Container Apps + PostgreSQL/pgvector + Blob (`australiasoutheast`).
+- **Hosting (planned live):** Static Web Apps (`eastasia`), Container Apps + Blob (`australiasoutheast`); DB on Supabase (pgvector, schema `knowledge_intelligence`); images on public GHCR.
 - Independent of Enterprise AI Agent Platform (`rg-knowledge-intelligence-demo` only).
 
 **Live demo:** Coming soon. Public demo will use synthetic corpora, rate limits, and LLM usage caps (see `infra/README.md`). Do not create Azure resources until an explicit deploy is approved.

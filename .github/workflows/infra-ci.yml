@@ -38,22 +38,26 @@ jobs:
       - name: Build bootstrap template
         uses: azure/cli@v2
         with:
-          inlineScript: az bicep build --file infra/bootstrap/main.bicep
+          inlineScript: |
+            az bicep build --file infra/bootstrap/main.bicep
 
       - name: Build main template
         uses: azure/cli@v2
         with:
-          inlineScript: az bicep build --file infra/main.bicep
+          inlineScript: |
+            az bicep build --file infra/main.bicep
 
       - name: Lint bootstrap template
         uses: azure/cli@v2
         with:
-          inlineScript: az bicep lint --file infra/bootstrap/main.bicep
+          inlineScript: |
+            az bicep lint --file infra/bootstrap/main.bicep
 
       - name: Lint main template
         uses: azure/cli@v2
         with:
-          inlineScript: az bicep lint --file infra/main.bicep
+          inlineScript: |
+            az bicep lint --file infra/main.bicep
 
   what-if:
     name: Azure what-if (optional)
@@ -74,8 +78,7 @@ jobs:
 
       - name: Validate deploy secrets
         env:
-          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
-          POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           set -euo pipefail
@@ -84,18 +87,20 @@ jobs:
 
       - name: What-if resource group deployment
         env:
-          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
-          POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         uses: azure/cli@v2
         with:
           inlineScript: |
             set -euo pipefail
+            EXTRA_PARAMS=()
+            if [[ -n "${LLM_API_KEY:-}" ]]; then
+              EXTRA_PARAMS+=(--parameters "llmApiKey=${LLM_API_KEY}")
+              EXTRA_PARAMS+=(--parameters "enableLlmApiKey=true")
+            fi
             az deployment group what-if \
               --resource-group rg-knowledge-intelligence-demo \
               --template-file infra/main.bicep \
               --parameters infra/parameters/demo.bicepparam \
-              --parameters \
-                postgresAdminPassword="${POSTGRES_ADMIN_PASSWORD}" \
-                postgresAppPassword="${POSTGRES_APP_PASSWORD:-}" \
-                llmApiKey="${LLM_API_KEY:-}"
+              --parameters "databaseUrl=${DATABASE_URL:-}" \
+              ${EXTRA_PARAMS[@]+"${EXTRA_PARAMS[@]}"}

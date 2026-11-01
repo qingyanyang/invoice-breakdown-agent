@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       run_bootstrap:
-        description: "Deploy subscription bootstrap (create rg-knowledge-intelligence-demo)"
+        description: "Create resource group if needed"
         type: boolean
         default: false
+
       confirm_destructive:
         description: "Type DEPLOY to confirm infrastructure deployment"
         type: string
@@ -22,17 +23,24 @@ concurrency:
 
 env:
   RESOURCE_GROUP: rg-knowledge-intelligence-demo
+  LOCATION: australiasoutheast
+  PARAMETER_FILE: infra/parameters/demo.bicepparam
 
 jobs:
   deploy:
     name: Deploy infrastructure (demo)
     runs-on: ubuntu-latest
     environment: demo
+
     steps:
       - name: Confirm deployment intent
+        env:
+          CONFIRMATION: ${{ inputs.confirm_destructive }}
         run: |
-          if [ "${{ inputs.confirm_destructive }}" != "DEPLOY" ]; then
-            echo "Refusing to deploy. Set confirm_destructive=DEPLOY to proceed."
+          set -euo pipefail
+
+          if [ "$CONFIRMATION" != "DEPLOY" ]; then
+            echo "ERROR: Type DEPLOY to confirm."
             exit 1
           fi
 
@@ -47,49 +55,77 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Bootstrap resource group
-        if: ${{ inputs.run_bootstrap }}
+        if: inputs.run_bootstrap
         run: |
           set -euo pipefail
-          az deployment sub create \
-            --location australiasoutheast \
-            --template-file infra/bootstrap/main.bicep \
-            --parameters resourceGroupName=rg-knowledge-intelligence-demo location=australiasoutheast
 
-      # Empty .bicepparam defaults are for file evaluation only — gate before deploy.
-      - name: Validate deploy secrets
+          az deployment sub create \
+            --location "$LOCATION" \
+            --template-file infra/bootstrap/main.bicep \
+            --parameters \
+              resourceGroupName="$RESOURCE_GROUP" \
+              location="$LOCATION"
+
+      - name: Validate deployment secrets
         env:
-          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
-          POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           set -euo pipefail
-          chmod +x infra/scripts/validate-deploy-secrets.sh
-          ./infra/scripts/validate-deploy-secrets.sh infra/parameters/demo.bicepparam
 
-      # Option A: Bicep declares postgres-password + llm-api-key. Always re-supply both on CA redeploy.
+          bash infra/scripts/validate-deploy-secrets.sh "$PARAMETER_FILE"
+
+      - name: Validate Bicep deployment
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          EXTRA_PARAMS=()
+          if [[ -n "${LLM_API_KEY:-}" ]]; then
+            EXTRA_PARAMS+=(--parameters "llmApiKey=${LLM_API_KEY}")
+            EXTRA_PARAMS+=(--parameters "enableLlmApiKey=true")
+          fi
+
+          az deployment group validate \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/main.bicep \
+            --parameters "$PARAMETER_FILE" \
+            --parameters "databaseUrl=${DATABASE_URL}" \
+            ${EXTRA_PARAMS[@]+"${EXTRA_PARAMS[@]}"}
+
       - name: Deploy resource group infrastructure
         env:
-          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
-          POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
           set -euo pipefail
+
+          DEPLOYMENT_NAME="eki-demo-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "DEPLOYMENT_NAME=$DEPLOYMENT_NAME" >> "$GITHUB_ENV"
+
+          EXTRA_PARAMS=()
+          if [[ -n "${LLM_API_KEY:-}" ]]; then
+            EXTRA_PARAMS+=(--parameters "llmApiKey=${LLM_API_KEY}")
+            EXTRA_PARAMS+=(--parameters "enableLlmApiKey=true")
+          fi
+
           az deployment group create \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --name "eki-demo-$(date +%Y%m%d%H%M%S)" \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$DEPLOYMENT_NAME" \
             --template-file infra/main.bicep \
-            --parameters infra/parameters/demo.bicepparam \
-            --parameters \
-              postgresAdminPassword="${POSTGRES_ADMIN_PASSWORD}" \
-              postgresAppPassword="${POSTGRES_APP_PASSWORD:-}" \
-              llmApiKey="${LLM_API_KEY:-}"
+            --parameters "$PARAMETER_FILE" \
+            --parameters "databaseUrl=${DATABASE_URL}" \
+            ${EXTRA_PARAMS[@]+"${EXTRA_PARAMS[@]}"}
 
       - name: Print non-sensitive outputs
         run: |
           set -euo pipefail
-          DEPLOY_NAME="$(az deployment group list -g "${{ env.RESOURCE_GROUP }}" --query '[0].name' -o tsv)"
+
           az deployment group show \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --name "${DEPLOY_NAME}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$DEPLOYMENT_NAME" \
             --query properties.outputs \
             -o json

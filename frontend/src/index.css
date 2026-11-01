@@ -1,0 +1,33 @@
+@import 'tailwindcss';
+
+@theme inline {
+  --font-sans: 'Segoe UI', 'Helvetica Neue', ui-sans-serif, system-ui, sans-serif;
+  --color-background: oklch(0.985 0.01 160);
+  --color-foreground: oklch(0.22 0.03 160);
+  --color-muted: oklch(0.95 0.015 160);
+  --color-muted-foreground: oklch(0.48 0.03 160);
+  --color-card: oklch(1 0 0);
+  --color-border: oklch(0.9 0.015 160);
+  --color-primary: oklch(0.4 0.08 165);
+  --color-primary-foreground: oklch(0.99 0 0);
+  --color-accent: oklch(0.7 0.1 85);
+  --color-ring: oklch(0.4 0.08 165);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply antialiased;
+  }
+
+  body {
+    @apply m-0 min-h-svh bg-background font-sans text-foreground;
+  }
+
+  #root {
+    @apply min-h-svh;
+  }
+}

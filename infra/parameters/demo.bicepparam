@@ -11,38 +11,24 @@ param tags = {
   managedBy: 'bicep'
 }
 
-// Dual-path secrets (empty defaults are for CI file-eval only — do not deploy with empties).
-// Local: export vars, then run infra/scripts/validate-deploy-secrets.sh before az deploy.
+// Dual-path secrets (empty defaults are for CI file-eval only — do not deploy with empty DATABASE_URL).
+// Local: export DATABASE_URL (and optionally LLM_API_KEY), then run infra/scripts/validate-deploy-secrets.sh.
 // CI:    infra-cd.yml validates, then --parameters overrides.
-// Option A: Bicep owns postgres-password + llm-api-key. Do not CLI/portal-manage them.
-// Gates: always require POSTGRES_ADMIN_PASSWORD; when deployContainerApp=true also require
-//        POSTGRES_APP_PASSWORD + LLM_API_KEY (and a non-empty containerImage).
-param postgresAdminLogin = 'pgadmin'
-param postgresAdminPassword = readEnvironmentVariable('POSTGRES_ADMIN_PASSWORD', '')
-
-param postgresAppLogin = 'eki_app'
-param postgresAppPassword = readEnvironmentVariable('POSTGRES_APP_PASSWORD', '')
-
+// Gates: Phase 1 needs no secrets. When deployContainerApp=true require DATABASE_URL
+//        and a non-empty public GHCR containerImage. LLM_API_KEY is optional (skip until LLM is wired).
+//
+// DATABASE_URL: use Supabase *session pooler* connection string (IPv4-friendly), e.g.
+//   postgresql+psycopg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+// Prefer building/encoding the URL in your secret store; never commit it.
+// Schema isolation (shared Supabase project with Agent Platform): knowledge_intelligence
+param databaseUrl = readEnvironmentVariable('DATABASE_URL', '')
 param llmApiKey = readEnvironmentVariable('LLM_API_KEY', '')
+// Non-secure gate: empty(@secure()) is unreliable in ARM, so scripts/CI set this explicitly.
+param enableLlmApiKey = false
+param postgresSchema = 'knowledge_intelligence'
 
-param postgresVersion = '16'
-param postgresSkuName = 'Standard_B1ms'
-param postgresSkuTier = 'Burstable'
-param postgresStorageSizeGb = 32
-param postgresBackupRetentionDays = 7
-param postgresDatabaseName = 'knowledge_intelligence_db'
-param postgresAzureExtensions = 'vector'
-
-// WARNING (public demo only): allows any Azure IP to attempt Postgres auth.
-// Mitigations: TLS (sslmode=require), strong password, no committed credentials.
-// Future staging/production parameter files MUST set allowAzureServicesAccess = false
-// and use IP allowlists or private networking instead.
-param allowAzureServicesAccess = true
-
-param postgresFirewallRules = []
-
-// Phase 1: false — UAMI + AcrPull still created; no Container App until image exists.
-// Phase 2: after first FastAPI image is in ACR, set true and set containerImage.
+// Phase 1: false — no Container App until a public GHCR image exists.
+// Phase 2: set true + containerImage = 'ghcr.io/<github-username>/knowledge-intelligence-api:<tag>'
 param deployContainerApp = false
 param containerImage = ''
 
@@ -56,4 +42,3 @@ param corsAllowedOrigins = [
 ]
 
 param staticWebAppSkuName = 'Free'
-param acrSkuName = 'Basic'

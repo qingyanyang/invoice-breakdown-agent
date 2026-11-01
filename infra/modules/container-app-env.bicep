@@ -14,8 +14,8 @@ param logAnalyticsSharedKey string
 @description('Resource tags.')
 param tags object = {}
 
-// Consumption environment without custom VNet (MVP). Outbound IPs are not static;
-// Postgres connectivity relies on parameterized firewall rules (see postgresql.bicep).
+// Consumption environment without custom VNet (MVP). Outbound IPs are not static.
+// Database is external Supabase (session pooler); no Azure Postgres firewall in this stack.
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: name
   location: location

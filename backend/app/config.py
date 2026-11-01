@@ -1,0 +1,20 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    environment: str = "development"
+    database_url: str | None = None
+    postgres_schema: str = "knowledge_intelligence"
+    cors_allowed_origins: str = "http://localhost:5173"
+    llm_api_key: str | None = None
+    azure_storage_blob_endpoint: str | None = None
+    azure_storage_documents_container: str = "documents"
+    azure_storage_processed_documents_container: str = "processed-documents"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+    )
+
+
+settings = Settings()
