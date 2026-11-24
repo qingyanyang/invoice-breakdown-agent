@@ -28,6 +28,7 @@ ISSUE_DETAILS = {
     "untraced_source_rows": "These amount rows have no established contribution or exclusion. Confirm the source hierarchy with supporting evidence.",
     "control_total_discrepancy": "The independent total differs from the reported Total at cent precision. Supply corrected source evidence.",
     "missing_independent_total": "An independent control amount could not be established.",
+    "mixed_contributing_gst_bases": "A contributing amount explicitly uses a different GST basis from the source control.",
 }
 
 
@@ -278,6 +279,19 @@ class Reconciliation:
             self.issue("untraced_source_rows", untraced)
         return outside
 
+    def check_contributing_basis(self, control: SourceRow, basis: str | None) -> None:
+        if basis is None:
+            return
+        refs = set(self.selected)
+        refs.update(Reference.from_dict(group["reference"]) for group in self.groups)
+        refs.discard(control.amount)
+        conflicts = [
+            ref for ref in sorted(refs)
+            if (stated := tax_basis(self.workbook.row_for(ref).description)) and stated != basis
+        ]
+        if conflicts:
+            self.issue("mixed_contributing_gst_bases", conflicts)
+
     def bridge(self, scope: dict, outside: list[dict]) -> tuple[list[dict], list[dict], Decimal]:
         selected = {ref.key: (ref, item) for ref, item in self.selected.items()}
         outside_rows = {Reference.from_dict(item["reference"]).key: item for item in outside}
@@ -351,6 +365,7 @@ def reconcile(extraction: dict, scope: dict, answers: dict) -> dict:
             else:
                 independent, omitted = run.trace_literal_total(row)
             outside = run.check_coverage(list(evidence.detail_rows()), declared and independent is not None, omitted)
+            run.check_contributing_basis(row, gst_basis)
             if independent is not None and recorded is not None:
                 exact_difference = independent - recorded
                 difference = cents(independent) - cents(recorded)

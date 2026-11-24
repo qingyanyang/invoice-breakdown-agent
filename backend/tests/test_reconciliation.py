@@ -160,3 +160,15 @@ def test_missing_total_cache_and_actual_discrepancy_block(workbook_with):
     ]), SOURCE, {})
     assert mismatch["status"] == "blocked" and mismatch["difference"] == "0.01"
     assert mismatch["working_scope_total"] is None
+
+
+def test_mixed_contributing_gst_bases_block_even_with_matching_total(workbook_with):
+    evidence = evidence_for(workbook_with, [
+        ("Base work", "75", None),
+        ("Project Total incl GST", "75", "D4"),
+        ("Final Total ex GST", "75", "D5"),
+    ])
+    report = reconcile(evidence, SOURCE, {})
+    assert report["difference"] == "0.00"
+    assert report["status"] == "blocked"
+    assert any(issue["code"] == "mixed_contributing_gst_bases" for issue in report["issues"])

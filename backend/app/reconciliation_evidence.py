@@ -184,6 +184,7 @@ class WorkbookEvidence:
                         seen_candidates.add(amount)
                         row = self.rows.get(amount, SourceRow(amount, text, label, {}))
                         self.candidates.append(ControlCandidate(row, kind))
+        self.control_rows = {candidate.row.amount: candidate.row for candidate in self.candidates}
 
     def detail_rows(self):
         return (
@@ -193,7 +194,7 @@ class WorkbookEvidence:
         )
 
     def row_for(self, ref: Reference) -> SourceRow:
-        return self.rows.get(ref, SourceRow(ref, "", None, {}))
+        return self.rows.get(ref) or self.control_rows.get(ref) or SourceRow(ref, "", None, {})
 
 
 def parse_ref(token: str, sheet: str) -> Reference:
