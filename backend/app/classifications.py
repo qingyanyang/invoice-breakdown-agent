@@ -68,7 +68,7 @@ def identity(reconciliation: ReconciliationDetails):
 
 async def classification_record(connection: AsyncConnection, reconciliation: ReconciliationDetails):
     return (await connection.execute(select(source_classifications).filter_by(
-        **identity(reconciliation), source_sha256=reconciliation.source_sha256,
+        **identity(reconciliation), source_sha256=reconciliation.source_sha256, classifier_version=CLASSIFIER_VERSION,
     ))).mappings().one_or_none()
 
 
@@ -103,12 +103,17 @@ async def run_classification(
         if current is not None and current["status"] != "failed":
             return ClassificationDetails.model_validate(current)
 
-    skill_sha256 = proposal = None
+    skill_sha256 = proposal = supplementary = None
     model = settings.classification_model
     proposal_id = uuid4()
     try:
-        specification = await classification_model.load_primary_specification(settings.classification_skill_path)
+        specification = await classification_model.load_primary_specification(
+            settings.classification_skill_path, settings.classification_codex_path,
+        )
         skill_sha256 = specification.sha256
+        supplementary = specification.supplementary.provenance()
+        if supplementary["status"] not in {"applied", "not_configured"}:
+            logger.warning("Supplementary classification rules unavailable: %s", supplementary["status"])
         evidence = await to_thread.run_sync(make_evidence, extraction.result, reconciliation.report)
         inputs = await to_thread.run_sync(evidence.model_input)
         proposal = await classification_model.propose(settings, specification, inputs)
@@ -117,6 +122,8 @@ async def run_classification(
         logger.warning("Classification unavailable: %s", error.code)
         report = failure_report(error.code)
         proposal = None
+    if supplementary is not None:
+        report["supplementary_rules"] = supplementary
 
     async with transaction(engine) as connection:
         revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
@@ -178,6 +185,7 @@ async def answer_classification(
         report = await to_thread.run_sync(
             build_classification, evidence, proposal, decisions, str(current["proposal_id"]),
         )
+        report["supplementary_rules"] = current["report"]["supplementary_rules"]
         return await save_classification(
             connection, reconciliation, current["proposal_id"], current["skill_sha256"],
             current["model"], proposal, decisions, report,

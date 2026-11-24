@@ -273,8 +273,13 @@ through the deployment secret or a private local environment. Enable the
 provider only for workbook evidence the company allows it to process.
 The request sends the full primary specification, current working-row
 descriptions, relevant source labels and Notes. The source workbook, target
-amount and operator credentials stay in the service. The supplementary
-`Invoice.Breakdown.Codex.md` file is optional for Issue #8.
+amount and operator credentials stay in the service. Optionally set
+`CLASSIFICATION_CODEX_PATH` to the approved `Invoice.Breakdown.Codex.md`.
+The backend checks the registered 2026-10-05 SHA-256 and sends only its
+classification and area sections (IV–V). The report records whether the
+supplement was applied, with its checksum and chapters when verified.
+Classification can proceed from `SKILL.md` alone when the supplement is
+absent or fails verification.
 Run `alembic upgrade head` explicitly before enabling classification.
 
 | Method and path | Request and result |
@@ -290,13 +295,13 @@ Semantic proposals retain their rationale and provenance for review. An
 owner's answer is recorded as a confirmed interpretation and carries no
 new price. Complete classification reaches `ready_for_allocation`.
 
-An explicitly priced Glazing component in the combined Partition row can
-be removed from the trusted parent amount when both use the same markup
-basis. The report records the parent price, component price, header,
-signed coefficient and subtraction. Unsupported splits require
-clarification. Identified area labels are retained as written, including
-combined floors. Rows without an area go to `Additional Items`; no
-separate floor amounts are invented.
+A priced Glazing component can be subtracted from the Partition parent
+when a workbook label establishes its inclusion and both use the same
+markup basis. The report records the parent, component, inclusion
+reference and subtraction. Unsupported splits require clarification.
+When a proposal differs from the only source area label, the owner can
+confirm the recorded attribution, including combined floors. Rows without
+an area go to `Additional Items`.
 
 A conflict between an Access Panel exclusion note and a priced working
 row pauses classification. If the owner requests a scope change, make it in
@@ -304,7 +309,9 @@ reconciliation before rerunning classification. Each scope or reconciliation
 decision change creates a new generation, invalidating earlier answers
 and assignments even if the task revision stays the same. Source and
 target revisions also invalidate prior classification. Pending answers
-can resume from the persisted proposal after restart.
+can resume from the persisted proposal after restart. Classifier upgrades
+that change the version require a fresh classification for the current
+reconciliation.
 
 An unavailable provider, invalid proposal or missing primary specification
 records a failed outcome. The request supports up to 300 working rows and

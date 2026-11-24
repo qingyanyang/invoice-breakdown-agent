@@ -13,12 +13,28 @@ FLOOR_LABEL = r"(?:(?:levels?|floors?)\s+\w+|(?:ground|lower ground|upper ground
 FLOOR_HEADING = re.compile(
     rf"^{FLOOR_LABEL}(?:\s*(?:and|&|/|\+|,|–|-)\s*(?:{FLOOR_LABEL}|[0-9]+[A-Za-z]?))*$", re.I,
 )
-GLAZING = re.compile(r"\b(?:glazing|glass|mullions?)\b")
+GLAZING_COMPONENT = r"(?:glazing(?: frames?)?|glass|mullions?)"
+GLAZING = re.compile(rf"\b{GLAZING_COMPONENT}\b")
+GLAZING_EXCLUDED = re.compile(
+    rf"\b(?:(?:excludes?|excluding|excl|ex|without|no|not (?:include|including|with)) "
+    rf"(?:(?:the|all|any) )?{GLAZING_COMPONENT}"
+    rf"|{GLAZING_COMPONENT} (?:(?:is|are) )?(?:excluded|not included|by others|separate|omitted))\b",
+)
+GLAZING_INCLUDED = re.compile(
+    rf"(?:combined )?partition (?:and|with|includes?|including|incl) (?:the )?{GLAZING_COMPONENT}"
+    r"(?: (?:works|amount|subtotal|total))?",
+)
 GLAZING_PRICE = re.compile(
-    r"(?:glazing|glass|glazing frames?|mullions?) (?:amount|price)(?: (?:incl(?:uding)?|excl(?:uding)?) markup)?",
+    rf"{GLAZING_COMPONENT} (?:amount|price)(?: (?:incl(?:uding)?|excl(?:uding)?) markup)?"
+    r"(?: included in partition(?: (?:amount|subtotal|total))?)?",
 )
 MARKUP_BASIS = {"included": r"\bincl(?:uding)? markup\b", "excluded": r"\bexcl(?:uding)? markup\b"}
 PANEL = re.compile(r"\baccess panels?\b")
+PANEL_LABEL = re.compile(
+    rf"(?:{FLOOR_LABEL} )?(?:(?:supply and install|supply of|installation of|install|provide) )?"
+    rf"(?:{FLOOR_LABEL} )?(?:ceiling )?(?:(?:standard|perforated|feature|pv) )?access panels?"
+    r"(?: (?:allowance|adjustment|supply|installation|credit))?",
+)
 EXCLUSION = re.compile(r"\b(?:exclud\w*|not (?:included|allowed|provided)|by others|omitted|no access panels?)\b")
 NO_EXCLUSION = re.compile(r"\b(?:not excluded|no exclusions?)\b")
 
@@ -85,7 +101,7 @@ def stated_trade(description: str) -> str | None:
         return "Ceiling"
     if re.fullmatch(r"(?:make good|patch(?:ing)? and repair(?:s)?|repair(?:s)? and patch(?:ing)?)", words):
         return "Make Good"
-    if re.fullmatch(r"(?:ceiling )?access panels?(?: (?:allowance|adjustment|supply|installation))?", words):
+    if PANEL_LABEL.fullmatch(words):
         return "Access Panel"
     if re.fullmatch(r"(?:glazing|glass|glazing frames?|mullions?)(?: (?:allowance|adjustment|supply|installation))?", words):
         return "Glazing"
@@ -199,6 +215,9 @@ class ClassificationEvidence:
         if "partition" not in clean(row.description).split():
             return {}
         context = self.row_context[row.reference.key]
+        description = clean(row.description)
+        excluded = GLAZING_EXCLUDED.search(description)
+        included = GLAZING_INCLUDED.fullmatch(description)
         prices = {}
         for column, header in context.headers.items():
             price = context.cells.get(column)
@@ -211,12 +230,21 @@ class ClassificationEvidence:
             amount = numeric(cell, literal=True)
             signed = amount.copy_negate() if amount is not None and row.coefficient == -1 else amount
             basis = MARKUP_BASIS.get(row.markup)
-            same_basis = re.search(basis, label) is not None if basis else not label.endswith("markup")
+            same_basis = re.search(basis, label) is not None if basis else "markup" not in label.split()
+            inclusion_reference = None
+            if not excluded:
+                if included:
+                    inclusion_reference = row.label.key
+                elif " included in partition" in label:
+                    inclusion_reference = header.key
             supported = (
-                price not in self.scope_refs and same_basis and signed
+                inclusion_reference and price not in self.scope_refs and same_basis and signed
                 and signed.is_signed() == row.amount.is_signed() and signed.copy_abs() < row.amount.copy_abs()
             )
-            prices[price.key] = {"price": price.key, "label": header.key, "amount": signed if supported else None}
+            prices[price.key] = {
+                "price": price.key, "label": header.key, "inclusion_reference": inclusion_reference,
+                "amount": signed if supported else None,
+            }
         return prices
 
     def model_input(self) -> dict:
@@ -229,7 +257,10 @@ class ClassificationEvidence:
                     "text_evidence": self.row_context[key].text,
                     "area_candidates": self.row_context[key].areas,
                     "glazing_price_evidence": [
-                        {"price": piece["price"], "label": piece["label"], "eligible": piece["amount"] is not None}
+                        {
+                            "price": piece["price"], "label": piece["label"], "eligible": piece["amount"] is not None,
+                            "inclusion_reference": piece["inclusion_reference"],
+                        }
                         for piece in self.glazing_prices(row).values()
                     ],
                 }

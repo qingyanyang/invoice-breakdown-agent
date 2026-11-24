@@ -1,13 +1,15 @@
 import asyncio
 import hashlib
 
+import httpx
 import pytest
+from pydantic import SecretStr
 
-from app import classification_model
+from app import classification_model, classifications
 from app.checkpoints import setup_checkpoints
 from app.classify import Proposal
 from app.config import settings
-from test_classification import SHEET, write_skill
+from test_classification import SHEET, write_codex, write_skill
 from test_reconciliation import SHEET_NS, WORKSHEET, source_sheet
 from test_reconciliation_api import ALICE, BOB, create_source, establish_evidence, service, success
 
@@ -30,6 +32,7 @@ def model_answer(inputs, by_row):
 def configured_skill(monkeypatch, tmp_path):
     skill = write_skill(tmp_path)
     monkeypatch.setattr(settings, "classification_skill_path", skill)
+    monkeypatch.setattr(settings, "classification_codex_path", None)
     monkeypatch.setattr(settings, "classification_model", "example-model")
     return skill
 
@@ -46,8 +49,11 @@ async def ready_task(client, workbook):
 
 @pytest.mark.anyio
 async def test_classification_resumes_persisted_scope_answer_after_restart(
-    task_runtime, configured_skill, monkeypatch, workbook_with,
+    task_runtime, configured_skill, monkeypatch, workbook_with, tmp_path,
 ):
+    codex = write_codex(tmp_path, monkeypatch)
+    monkeypatch.setattr(settings, "classification_codex_path", codex)
+
     async def model(_settings, spec, inputs):
         assert spec.sha256 == hashlib.sha256(configured_skill.read_bytes()).hexdigest()
         return model_answer(inputs, {f"{SHEET}!D4": "Access Panel"})
@@ -78,6 +84,10 @@ async def test_classification_resumes_persisted_scope_answer_after_restart(
         assert draft["status"] == "blocked"
         assert draft["reconciliation_generation"] == reconciliation["generation"]
         assert draft["skill_sha256"] == hashlib.sha256(configured_skill.read_bytes()).hexdigest()
+        assert draft["report"]["supplementary_rules"] == {
+            "status": "applied", "version": "2026-10-05",
+            "sha256": hashlib.sha256(codex.read_bytes()).hexdigest(), "sections": ["IV", "V"],
+        }
         question, = draft["report"]["questions"]
         assert question["kind"] == "access_panel_scope"
         assert question["evidence"] == [f"{SHEET}!A4", f"{SHEET}!D4", "Notes!A1"]
@@ -88,6 +98,7 @@ async def test_classification_resumes_persisted_scope_answer_after_restart(
     monkeypatch.setattr(classification_model, "propose", unavailable)
     # Simulate restarting the application without its model or specification credentials.
     monkeypatch.setattr(settings, "classification_skill_path", None)
+    monkeypatch.setattr(settings, "classification_codex_path", None)
     async with service() as client:
         answer = {
             **START, "question_id": question["id"], "answer": "retain_scope",
@@ -108,6 +119,7 @@ async def test_classification_resumes_persisted_scope_answer_after_restart(
         assert sorted(reply.status_code for reply in replies) == [200, 409]
         result = success(await client.get(path, headers=ALICE))
         assert result["status"] == "ready_for_allocation" and result["report"]["classified_total"] == "100.00"
+        assert result["report"]["supplementary_rules"] == draft["report"]["supplementary_rules"]
         assert result["decisions"][question["key"]]["operator"] == "alice"
         assert result["decisions"][question["key"]]["evidence"] == question["evidence"]
         panel, _ = result["report"]["assignments"]
@@ -213,10 +225,15 @@ async def test_classification_rejects_stale_publication(
 
 @pytest.mark.anyio
 async def test_model_failure_is_persisted_and_retryable(task_runtime, configured_skill, monkeypatch, workbook_with):
-    async def failed(*_args):
-        raise classification_model.ClassificationModelError("model_unavailable")
+    client_class = httpx.AsyncClient
 
-    monkeypatch.setattr(classification_model, "propose", failed)
+    def malformed(_request):
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": None}]})
+
+    monkeypatch.setattr(settings, "llm_api_key", SecretStr("example-key"))
+    monkeypatch.setattr(classification_model.httpx, "AsyncClient", lambda **kwargs: client_class(
+        transport=httpx.MockTransport(malformed), **kwargs,
+    ))
     source = workbook_with({WORKSHEET: source_sheet([
         ("Temporary hoarding", "100", None), ("Project Total ex GST", "100", "D4"),
     ])})
@@ -228,7 +245,8 @@ async def test_model_failure_is_persisted_and_retryable(task_runtime, configured
         failed_record = success(await client.get(path, headers=ALICE))
         assert failed_record["status"] == "failed"
         assert failed_record["report"] == {
-            "status": "failed", "error": "model_unavailable", "questions": [], "assignments": [],
+            "status": "failed", "error": "invalid_model_proposal", "questions": [], "assignments": [],
+            "supplementary_rules": {"status": "not_configured", "version": None, "sha256": None, "sections": []},
         }
 
     async def available(_settings, _spec, inputs):
@@ -239,3 +257,64 @@ async def test_model_failure_is_persisted_and_retryable(task_runtime, configured
         result = success(await client.post(path, headers=ALICE, json=START))
         assert result["status"] == "ready_for_allocation" and result["report"]["classified_total"] == "100.00"
         assert success(await client.post(path, headers=ALICE, json=START)) == result
+
+
+@pytest.mark.anyio
+async def test_corrected_doors_trade_clears_false_panel_scope_conflict(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    async def model(_settings, _spec, inputs):
+        return model_answer(inputs, {f"{SHEET}!D4": "Access Panel"})
+
+    monkeypatch.setattr(classification_model, "propose", model)
+    source = workbook_with({
+        WORKSHEET: source_sheet([
+            ("FF&E", "40", None), ("Project Total ex GST", "40", "D4"),
+        ]),
+        "xl/worksheets/sheet2.xml": f"""
+<worksheet xmlns="{SHEET_NS}"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Access Panels excluded.</t></is></c></row>
+</sheetData></worksheet>""".encode(),
+    })
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, source)
+        path = f"/tasks/{task_id}/classification"
+        draft = success(await client.post(path, headers=ALICE, json=START))
+        question, = draft["report"]["questions"]
+        assert question["kind"] == "trade"
+        ready = success(await client.post(path + "/answers", headers=ALICE, json={
+            **START, "question_id": question["id"], "answer": "Doors", "reason": "The FF&E item belongs to Doors.",
+        }))
+        assert ready["status"] == "ready_for_allocation"
+        assert ready["report"]["questions"] == []
+        item, = ready["report"]["assignments"]
+        assert (item["trade"], item["amount"], item["trade_origin"]) == ("Doors", "40", "operator_confirmed")
+
+
+@pytest.mark.anyio
+async def test_new_classifier_version_replaces_prior_ready_result(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    calls = []
+
+    async def model(_settings, _spec, inputs):
+        calls.append(True)
+        return model_answer(inputs, {})
+
+    monkeypatch.setattr(classification_model, "propose", model)
+    source = workbook_with({WORKSHEET: source_sheet([
+        ("Hoarding", "25", None), ("Project Total ex GST", "25", "D4"),
+    ])})
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, source)
+        path = f"/tasks/{task_id}/classification"
+        with monkeypatch.context() as old_classifier:
+            old_classifier.setattr(classifications, "CLASSIFIER_VERSION", "1")
+            old = success(await client.post(path, headers=ALICE, json=START))
+            assert old["status"] == "ready_for_allocation" and old["classifier_version"] == "1"
+        assert (await client.get(path, headers=ALICE)).status_code == 404
+        current = success(await client.post(path, headers=ALICE, json=START))
+        assert current["classifier_version"] == classifications.CLASSIFIER_VERSION
+        assert current["status"] == "ready_for_allocation" and len(calls) == 2

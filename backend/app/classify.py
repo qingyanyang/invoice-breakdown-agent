@@ -6,11 +6,11 @@ from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.classification_evidence import ClassificationEvidence, ClassificationEvidenceError, GLAZING, PANEL, stated_trade
+from app.classification_evidence import ClassificationEvidence, ClassificationEvidenceError, GLAZING, GLAZING_EXCLUDED, stated_trade
 from app.reconcile import cents
 from app.reconciliation_evidence import clean
 
-CLASSIFIER_VERSION = "1"
+CLASSIFIER_VERSION = "2"
 ADDITIONAL = "Additional Items"
 
 
@@ -96,11 +96,13 @@ class ClassificationRun:
         for key, row in self.evidence.rows.items():
             proposed = sources[key]
             refs = list(dict.fromkeys([row.label.key, *proposed.trade_evidence]))
-            area, area_refs, area_origin = self.resolve_area(key)
-            pieces, origin = self.resolve_trade(key, proposed, refs)
             scope_hold = False
-            if panel_notes and (PANEL.search(clean(row.description)) or proposed.trade == Trade.ACCESS_PANEL
-                                or any(trade == Trade.ACCESS_PANEL for trade, _, _ in pieces)):
+            explicit = stated_trade(row.description)
+            area, area_refs, area_origin = self.resolve_area(key, proposed.area)
+            pieces, origin = self.resolve_trade(key, proposed, refs, explicit)
+            if panel_notes and pieces and (
+                explicit == Trade.ACCESS_PANEL or any(trade == Trade.ACCESS_PANEL for trade, _, _ in pieces)
+            ):
                 scope_hold = self.resolve_scope(row, panel_notes)
             model_reviews.append({
                 "row": key, "trade": proposed.trade, "reason": proposed.reason, "evidence": refs,
@@ -147,23 +149,29 @@ class ClassificationRun:
             },
         }
 
-    def resolve_area(self, key: str):
+    def resolve_area(self, key: str, proposed_area: str | None):
         candidates = self.evidence.row_context[key].areas
         if not candidates:
             return ADDITIONAL, [], "unallocated"
         if len(candidates) == 1:
             area, refs = next(iter(candidates.items()))
-            return area, refs, "workbook"
-        area = self.ask(
-            "area", key, f"Which of the source area labels applies to {key}?",
-            list(dict.fromkeys([*candidates, ADDITIONAL])),
-            [ref for refs in candidates.values() for ref in refs],
-        )
+            if proposed_area is None or clean(proposed_area) == clean(area):
+                return area, refs, "workbook"
+            area = self.ask(
+                "area", key,
+                f"The proposed area differs from the source label at {key}. Confirm the source attribution.",
+                [area], refs,
+            )
+        else:
+            area = self.ask(
+                "area", key, f"Which of the source area labels applies to {key}?",
+                list(dict.fromkeys([*candidates, ADDITIONAL])),
+                [ref for refs in candidates.values() for ref in refs],
+            )
         return area, candidates.get(area, []), "operator_confirmed"
 
-    def resolve_trade(self, key: str, proposed: RowProposal, refs: list[str]):
+    def resolve_trade(self, key: str, proposed: RowProposal, refs: list[str], explicit: str | None):
         row = self.evidence.rows[key]
-        explicit = stated_trade(row.description)
         prices = self.evidence.glazing_prices(row)
         candidates = {key: evidence for key, evidence in prices.items() if evidence["amount"] is not None}
         if proposed.glazing_price in candidates and proposed.trade in (None, Trade.PARTITION):
@@ -172,11 +180,13 @@ class ClassificationRun:
         description = clean(row.description)
         combined = GLAZING.search(description) and "partition" in description.split()
         if combined or prices or proposed.glazing_price is not None:
+            unsplit_trades = [Trade.PARTITION] if GLAZING_EXCLUDED.search(description) else list(Trade)
             choice = self.ask(
                 "combined_trade", key,
                 f"How should the combined trade amount at {key} be classified? "
-                "A separate Glazing amount requires a priced source component on the same basis.",
-                [*candidates, *[f"keep:{trade}" for trade in Trade]],
+                "A separate Glazing amount requires source evidence that the priced component is included "
+                "in the parent on the same markup basis.",
+                [*candidates, *[f"keep:{trade}" for trade in unsplit_trades]],
                 [*refs, *[ref for price in prices.values() for ref in (price["label"], price["price"])]],
                 requires_reason=True,
             )
@@ -202,6 +212,7 @@ class ClassificationRun:
         evidence = {
             "parent": row.reference.key, "parent_amount": format(row.amount, "f"),
             "component": price["price"], "component_label": price["label"],
+            "inclusion_reference": price["inclusion_reference"],
             "component_amount": format(glazing, "f"), "component_coefficient": row.coefficient,
             "remainder": format(remainder, "f"),
         }
