@@ -1,5 +1,8 @@
 import os
+from io import BytesIO
+from pathlib import Path
 from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from sqlalchemy import create_engine
@@ -56,3 +59,23 @@ def disposable_postgres(monkeypatch, inherited_service_profile):
                 connection.execute(DropSchema(schema, cascade=True, if_exists=True))
         finally:
             admin.dispose()
+
+
+@pytest.fixture
+def workbook_with():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "tests" / "fixtures" / "invoice_breakdown" / "reconciliation.xlsx"
+    )
+
+    def build(overrides):
+        output = BytesIO()
+        with ZipFile(source) as original, ZipFile(output, "w", compression=ZIP_DEFLATED) as updated:
+            for name in original.namelist():
+                updated.writestr(name, overrides.get(name, original.read(name)))
+            for name, data in overrides.items():
+                if name not in original.namelist():
+                    updated.writestr(name, data)
+        return output.getvalue()
+
+    return build

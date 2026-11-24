@@ -12,7 +12,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import main
+from app import main, source_cleanup
 from app import tasks as task_api
 from app.config import settings
 from app.database import ALEMBIC_INI, metadata
@@ -41,6 +41,7 @@ def task_runtime(disposable_postgres, monkeypatch, tmp_path):
         return engine
 
     monkeypatch.setattr(main, "create_application_engine", engine_for_test)
+    monkeypatch.setattr(source_cleanup, "create_application_engine", engine_for_test)
     alembic = Config(str(ALEMBIC_INI))
     command.upgrade(alembic, "0001_database_baseline")
     command.upgrade(alembic, "head")
@@ -192,3 +193,52 @@ async def test_uncertain_commit_keeps_referenced_source(task_runtime, monkeypatc
             main.app.state.database_engine, main.app.state.source_storage, UUID(task_id), key,
         )
         assert file.read_bytes() == workbook
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        b'<unrelated xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>',
+        b'<?xml version="1.0" encoding="invalid-test-encoding"?><worksheet/>',
+    ],
+)
+async def test_invalid_sheet_leaves_task_unchanged(task_runtime, workbook_with, replacement):
+    workbook = workbook_with({"xl/worksheets/sheet1.xml": replacement})
+    async with running_service() as client:
+        task_id = (await create_task(client))["id"]
+        response = await upload(client, task_id, workbook)
+        assert response.status_code == 422, response.text
+        assert response.json() == {"detail": "Invalid or malformed .xlsx workbook"}
+        task = (await client.get(f"/tasks/{task_id}", headers=ALICE)).json()
+        assert task["revision"] == 1
+        assert task["status"] == "awaiting_source"
+    assert not list(task_runtime.rglob("*.xlsx"))
+
+
+@pytest.mark.anyio
+async def test_staging_cleanup_failure_still_publishes_and_can_be_recovered(
+    task_runtime, monkeypatch, caplog,
+):
+    workbook = (FIXTURES / "reconciliation.xlsx").read_bytes()
+    original_unlink = Path.unlink
+
+    def fail_staging_unlink(path, *args, **kwargs):
+        if path.suffix == ".staging":
+            raise PermissionError("private staging path")
+        original_unlink(path, *args, **kwargs)
+
+    async with running_service() as client:
+        task_id = (await create_task(client))["id"]
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", fail_staging_unlink)
+            response = await upload(client, task_id, workbook)
+        assert response.status_code == 200, response.text
+        assert response.json()["revision"] == 2
+        staged, = task_runtime.rglob("*.staging")
+        key = staged.relative_to(task_runtime).as_posix()
+        assert f"Source staging cleanup pending for key {key}" in caplog.text
+        assert "private staging path" not in caplog.text
+        assert await source_cleanup.cleanup(key)
+        assert not staged.exists()
+        assert (await client.get(f"/tasks/{task_id}/source", headers=ALICE)).content == workbook

@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -8,6 +9,8 @@ from azure.identity import ManagedIdentityCredential
 from azure.storage.blob import BlobServiceClient
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class StorageError(RuntimeError):
@@ -34,7 +37,12 @@ class LocalSourceStorage:
         temporary = None
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            with NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
+            with NamedTemporaryFile(
+                dir=destination.parent,
+                prefix=f".{destination.stem}.",
+                suffix=".staging",
+                delete=False,
+            ) as handle:
                 temporary = Path(handle.name)
                 handle.write(data)
                 handle.flush()
@@ -47,7 +55,13 @@ class LocalSourceStorage:
             raise StorageError from None
         finally:
             if temporary is not None:
-                temporary.unlink(missing_ok=True)
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Source staging cleanup pending for key %s",
+                        (destination.parent.relative_to(self.directory) / temporary.name).as_posix(),
+                    )
 
     def read(self, key: str, size: int) -> bytes:
         try:

@@ -4,7 +4,7 @@ from posixpath import normpath
 from urllib.parse import unquote, urlsplit
 from xml.etree.ElementTree import ParseError
 from xml.sax import SAXException
-from xml.sax.handler import ContentHandler
+from xml.sax.handler import ContentHandler, feature_namespaces
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 from zlib import error as ZipDataError
 
@@ -20,10 +20,17 @@ MAX_EXPANDED_BYTES = 64 * 1024 * 1024
 MAX_XML_BYTES = 1024 * 1024
 MAX_ENTRIES = 2048
 PACKAGE_RELATIONSHIPS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
-SHEET_RELATIONSHIP_IDS = (
-    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id",
-    "{http://purl.oclc.org/ooxml/officeDocument/relationships}id",
+DOCUMENT_RELATIONSHIP_NAMESPACES = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships",
 )
+SHEET_KINDS = {"worksheet", "chartsheet", "dialogsheet"}
+SHEET_TYPES = {
+    f"{namespace}/{kind}": kind
+    for namespace in DOCUMENT_RELATIONSHIP_NAMESPACES
+    for kind in SHEET_KINDS
+}
+SPREADSHEET_CONTENT_TYPE_PREFIX = "application/vnd.openxmlformats-officedocument.spreadsheetml."
 WORKBOOK_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
 
 
@@ -72,6 +79,25 @@ def internal_target(relationship, directory: str) -> str:
     return normpath(directory + "/" + target if not target.startswith("/") else target).lstrip("/")
 
 
+class SheetRoot(ContentHandler):
+    def __init__(self, expected: tuple[str, str]):
+        self.expected = expected
+
+    def startElementNS(self, name, _qualified_name, _attributes):
+        if self.expected is not None:
+            if name != self.expected:
+                raise BadZipFile
+            self.expected = None
+
+
+def validate_xml(file, expected_root: tuple[str, str] | None) -> None:
+    parser = sax.make_parser()
+    parser.forbid_dtd = True
+    parser.setFeature(feature_namespaces, True)
+    parser.setContentHandler(SheetRoot(expected_root) if expected_root else ContentHandler())
+    parser.parse(file)
+
+
 def validate_workbook(data: bytes) -> None:
     try:
         with ZipFile(BytesIO(data)) as archive:
@@ -93,21 +119,22 @@ def validate_workbook(data: bytes) -> None:
             content_types = read_package_xml(archive, "[Content_Types].xml")
             if content_types.tag != "{http://schemas.openxmlformats.org/package/2006/content-types}Types":
                 raise BadZipFile
+            overrides = {}
+            defaults = {}
             for declaration in content_types:
-                kind = declaration.get("ContentType", "").lower()
-                if any(marker in kind for marker in ("macroenabled", "macrosheet", "vba")):
+                kind = declaration.get("ContentType", "")
+                if any(marker in kind.lower() for marker in ("macroenabled", "macrosheet", "vba")):
                     raise HTTPException(415, "Macro-enabled workbooks are unsupported")
-            override = next(
-                (item.get("ContentType") for item in content_types
-                 if item.get("PartName") == "/xl/workbook.xml"),
-                None,
-            )
-            default = next(
-                (item.get("ContentType") for item in content_types
-                 if item.get("Extension", "").lower() == "xml"),
-                None,
-            )
-            if (override or default) != WORKBOOK_TYPE:
+                if path := declaration.get("PartName"):
+                    overrides[path] = kind
+                if extension := declaration.get("Extension"):
+                    defaults[extension.lower()] = kind
+
+            def content_type(part: str) -> str | None:
+                extension = PurePath(part).suffix.lstrip(".").lower()
+                return overrides.get("/" + part, defaults.get(extension))
+
+            if content_type("xl/workbook.xml") != WORKBOOK_TYPE:
                 raise BadZipFile
             package_documents = [
                 item for item in relationships(archive, "_rels/.rels")
@@ -133,18 +160,31 @@ def validate_workbook(data: bytes) -> None:
                 if not identifier or identifier in sheet_relationships:
                     raise BadZipFile
                 sheet_relationships[identifier] = item
+            expected_roots = {}
+            spreadsheet_namespace = workbook.tag[1:].split("}", 1)[0]
             for sheet in sheets:
-                identifier = next((sheet.get(key) for key in SHEET_RELATIONSHIP_IDS if key in sheet.attrib), None)
-                target = internal_target(sheet_relationships[identifier], "xl")
-                if archive.getinfo(target).is_dir():
+                if sheet.tag != f"{{{spreadsheet_namespace}}}sheet":
                     raise BadZipFile
+                identifier = next(
+                    (sheet.get(f"{{{namespace}}}id") for namespace in DOCUMENT_RELATIONSHIP_NAMESPACES
+                     if f"{{{namespace}}}id" in sheet.attrib),
+                    None,
+                )
+                relationship = sheet_relationships[identifier]
+                sheet_kind = SHEET_TYPES[relationship.get("Type")]
+                target = internal_target(relationship, "xl")
+                expected_type = f"{SPREADSHEET_CONTENT_TYPE_PREFIX}{sheet_kind}+xml"
+                if archive.getinfo(target).is_dir() or content_type(target) != expected_type:
+                    raise BadZipFile
+                expected_roots[target] = (spreadsheet_namespace, sheet_kind)
 
             expanded = 0
             for entry in entries:
                 with archive.open(entry) as file:
-                    if entry.filename.lower().endswith((".xml", ".rels")):
-                        # Check XML syntax without extracting cell values or following links.
-                        sax.parse(file, ContentHandler(), forbid_dtd=True)
+                    expected_root = expected_roots.get(entry.filename)
+                    if expected_root or entry.filename.lower().endswith((".xml", ".rels")):
+                        # Check XML syntax and sheet roots without reading cell values or following links.
+                        validate_xml(file, expected_root)
                         expanded += entry.file_size
                     else:
                         while chunk := file.read(64 * 1024):
@@ -152,7 +192,7 @@ def validate_workbook(data: bytes) -> None:
                     if expanded > MAX_EXPANDED_BYTES:
                         raise HTTPException(413, "Workbook exceeds the 64 MiB expanded limit")
     except (
-        BadZipFile, KeyError, ParseError, SAXException, DefusedXmlException, RuntimeError,
+        BadZipFile, LookupError, ParseError, SAXException, DefusedXmlException, RuntimeError,
         EOFError, NotImplementedError, ValueError, ZipDataError,
     ):
         raise HTTPException(422, "Invalid or malformed .xlsx workbook") from None

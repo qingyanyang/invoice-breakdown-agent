@@ -135,8 +135,9 @@ python -m app.source_cleanup 'sources/<task-id>/<file-id>.xlsx'
 ```
 
 The command preserves objects referenced by any revision, including old
-revisions. Keep the original storage backend and database paired when running
-cleanup.
+revisions. If a filesystem staging file could not be removed, pass the exact
+`.staging` key from the logs to the same command. Use the original filesystem
+storage and database for that cleanup.
 
 ## Tests
 

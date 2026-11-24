@@ -1,6 +1,5 @@
-from io import BytesIO
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZipFile
 
 import pytest
 from fastapi import HTTPException
@@ -16,17 +15,6 @@ FIXTURE = (
 )
 
 
-def workbook_with(overrides):
-    output = BytesIO()
-    with ZipFile(FIXTURE) as original, ZipFile(output, "w", compression=ZIP_DEFLATED) as updated:
-        for name in original.namelist():
-            updated.writestr(name, overrides.get(name, original.read(name)))
-        for name, data in overrides.items():
-            if name not in original.namelist():
-                updated.writestr(name, data)
-    return output.getvalue()
-
-
 def test_supported_workbook_and_filename():
     workbook_upload.validate_filename("Source.XLSX")
     workbook_upload.validate_workbook(FIXTURE.read_bytes())
@@ -39,7 +27,7 @@ def test_unsupported_extensions(filename):
     assert error.value.status_code == 415
 
 
-def test_zip_expanded_size_is_checked(monkeypatch):
+def test_zip_expanded_size_is_checked(monkeypatch, workbook_with):
     compressed = workbook_with({"xl/large.bin": b"0" * 100_000})
     monkeypatch.setattr(workbook_upload, "MAX_EXPANDED_BYTES", 50_000)
     assert len(compressed) < 50_000
@@ -76,20 +64,20 @@ def test_encrypted_zip_is_rejected():
 
 
 @pytest.mark.parametrize("path", ["xl/vbaProject.bin", "xl/macrosheets/sheet1.xml"])
-def test_macro_content_disguised_as_xlsx_is_rejected(path):
+def test_macro_content_disguised_as_xlsx_is_rejected(path, workbook_with):
     with pytest.raises(HTTPException) as error:
         workbook_upload.validate_workbook(workbook_with({path: b"unexpected macro part"}))
     assert error.value.status_code == 415
 
 
-def test_malformed_workbook_part_is_rejected():
+def test_malformed_workbook_part_is_rejected(workbook_with):
     malformed = workbook_with({"xl/worksheets/sheet1.xml": b"<worksheet"})
     with pytest.raises(HTTPException) as error:
         workbook_upload.validate_workbook(malformed)
     assert error.value.status_code == 422
 
 
-def test_missing_referenced_sheet_is_rejected():
+def test_missing_referenced_sheet_is_rejected(workbook_with):
     with ZipFile(FIXTURE) as original:
         relationships = original.read("xl/_rels/workbook.xml.rels")
     modified = relationships.replace(b"/xl/worksheets/sheet1.xml", b"/xl/missing.xml")
@@ -105,3 +93,31 @@ def test_shared_operator_tokens_are_rejected_without_exposing_them():
     with pytest.raises(ValueError) as error:
         operator_credentials(secret)
     assert shared not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("part", "original_text", "replacement"),
+    [
+        ("xl/_rels/workbook.xml.rels", b"/relationships/worksheet", b"/relationships/styles"),
+        ("[Content_Types].xml", b"spreadsheetml.worksheet+xml", b"spreadsheetml.styles+xml"),
+    ],
+)
+def test_sheet_type_and_content_type_must_match(workbook_with, part, original_text, replacement):
+    with ZipFile(FIXTURE) as original:
+        xml = original.read(part)
+    changed = xml.replace(original_text, replacement, 1)
+    assert changed != xml
+    with pytest.raises(HTTPException) as error:
+        workbook_upload.validate_workbook(workbook_with({part: changed}))
+    assert error.value.status_code == 422
+
+
+@pytest.mark.parametrize("part", ["xl/workbook.xml", "xl/worksheets/sheet1.xml"])
+def test_unsupported_xml_encoding_returns_422(workbook_with, part):
+    with ZipFile(FIXTURE) as original:
+        xml = original.read(part)
+    changed = xml.replace(b'encoding="utf-8"', b'encoding="invalid-test-encoding"', 1)
+    assert changed != xml
+    with pytest.raises(HTTPException) as error:
+        workbook_upload.validate_workbook(workbook_with({part: changed}))
+    assert error.value.status_code == 422
