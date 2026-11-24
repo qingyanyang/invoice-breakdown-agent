@@ -7,7 +7,16 @@ The business owner confirmed **Invoice.Breakdown.Codex.md**, version **2026-10-0
 ```
 
 Obtain the approved Markdown file from the business owner. Verify it with
-`shasum -a 256 /path/to/Invoice.Breakdown.Codex.md`. Resolve missing or conflicting versions with the owner. Read the approved file in full when first loaded for a task and pin one version for that task. The table is a section index for development.
+`shasum -a 256 /path/to/Invoice.Breakdown.Codex.md`. Read the approved file in
+full when first loaded for a task and pin one version for that task.
+
+If the reference is missing or copies conflict, record the unresolved input in
+the work item. Include the expected filename and version, where you checked,
+any candidate versions and checksums you found, and the rule decisions or
+fixture expectations that depend on it. Ask the business owner for the
+authorized path, attachment, or version. Keep the affected decisions and
+expectations pending until the owner confirms the copy and you verify its
+version and checksum.
 
 | Workflow concern | Approved specification sections |
 | --- | --- |

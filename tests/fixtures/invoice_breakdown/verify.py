@@ -51,6 +51,10 @@ def verify_reconciliation():
         notes = cells(workbook, 2)
         assert "outside the source total" in text(workbook, notes["A3"])
         assert text(workbook, source["B2"]) == "Excluding GST"
+        assert text(workbook, source["A10"]) == "Level 1 patching", "Trade Summary!A10"
+        assert text(workbook, source["A11"]) == "Level 1 Standard Access Panel", (
+            "Trade Summary!A11"
+        )
         for coordinate, formula in {
             "D4": "B4*(1+C4)",
             "D5": "B5*(1+C5)",
@@ -120,6 +124,12 @@ def verify_scope_ambiguity():
         assert sheet_names(workbook) == ["Trade Summary"]
         source = cells(workbook, 1)
         assert "Combined Level 1 and Level 2" in text(workbook, source["A4"])
+        assert text(workbook, source["A5"]) == "Option: Ceiling tile change", (
+            "Trade Summary!A5"
+        )
+        assert text(workbook, source["A6"]) == "Deletion: Ceiling tile credit", (
+            "Trade Summary!A6"
+        )
         base, option, deletion, total = (value(source[f"D{row}"]) for row in range(4, 8))
         assert (base, option, deletion, total) == (75, 15, -15, 75)
         assert base == total == base + option + deletion
