@@ -182,7 +182,7 @@ async def test_array_result_caches_remain_unverified_after_publication(task_runt
         assert facts["D2"]["formula"]["cache_status"] == "saved_unverified"
         assert facts["D3"]["raw_value"] == "3"
         assert facts["D3"]["formula"] == {
-            "text": None, "attributes": {"t": "array", "ref": "D2:D3"},
+            "text": None, "attributes": {}, "type": "array", "range": "D2:D3",
             "anchor": "D2", "cache_status": "saved_unverified",
         }
         assert facts["E3"]["formula"] is None

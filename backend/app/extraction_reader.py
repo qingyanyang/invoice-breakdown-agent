@@ -254,7 +254,9 @@ def mark_array_results(rows: list[dict], arrays: list[ArrayRange]) -> None:
                 raise BadZipFile
             cell["formula"] = {
                 "text": None,
-                "attributes": {"t": "array", "ref": array.reference},
+                "attributes": {},
+                "type": "array",
+                "range": array.reference,
                 "anchor": array.anchor,
                 "cache_status": "saved_unverified" if cell["raw_value"] not in (None, "") else "missing",
             }
