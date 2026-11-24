@@ -1,202 +1,23 @@
-# Enterprise Knowledge Intelligence
+# AFLUX Invoice Breakdown Agent
 
-> **Status: Planning / Initial development** · A portfolio project focused on retrieval quality, access-aware search, and grounded answers over enterprise knowledge.
+A headless, single-company backend for creating AFLUX Invoice Breakdown workbooks from project spreadsheets. The creation MVP will reconcile the source workbook, classify its amounts by trade and area, and produce a new workbook with traceable calculations. When an authorized target contract amount is supplied, the workflow will verify its GST basis and adjust eligible amounts while preserving protected amounts.
 
-A full-stack **Retrieval-Augmented Generation (RAG)** application for searching internal documents and technical knowledge with verifiable source references. The project emphasizes **data ingestion, hybrid retrieval, reranking, access control, and measurable evaluation**, rather than only building a chat interface.
+The current scaffold exposes a FastAPI health endpoint and includes PostgreSQL connection setup and Docker packaging. Workbook uploads, processing, and persistent execution are planned.
 
-The initial demo will use public or synthetic content such as PDF, Markdown, and C# source files. Enterprise connectors will be simulated or added incrementally.
+## Workflow goals
 
-## Problem
+- Preserve the source workbook and trace extracted values to their original sheets and cells.
+- Reconcile the source control total to the authorized scope and pause for material clarification.
+- Use model reasoning to interpret source structure and propose classifications. Enforce prerequisites, calculate monetary amounts with Decimal, and validate totals in code.
+- Persist task revisions, file references, clarifications, and LangGraph checkpoints in PostgreSQL.
+- Create a separate workbook and record which formula and layout checks were performed before delivery.
 
-Company knowledge is spread across documents, technical repositories, and storage systems. Basic keyword search may miss semantically related information, while naive vector-only RAG can retrieve irrelevant chunks or expose content to unauthorized users.
+The planned backend stack is Python, FastAPI, LangGraph, PostgreSQL or Supabase, Alembic, pytest, and Docker. The creation MVP is internal and API-first. Revisions, comparisons, approved-rule retrieval, and one chat integration are follow-on capabilities. Tax invoices, quotations, bookkeeping, payment reconciliation, and payment claims are outside the product scope.
 
-This project explores how to build a maintainable retrieval system that can answer questions with **relevant, authorized, traceable evidence**.
+## Run locally
 
-## Planned capabilities
+See the [backend setup](backend/README.md) for Python and Docker startup. Both support running the health endpoint without database credentials.
 
-- Ingest PDF, Markdown, and C# files with source metadata
-- Parse, normalize, and chunk content with configurable strategies
-- Generate embeddings and index content in PostgreSQL with **pgvector**
-- Combine vector similarity and PostgreSQL full-text search (**hybrid retrieval**)
-- Rerank candidate passages before context assembly
-- Generate answers with citations to source documents/chunks
-- Filter results by tenant, project, and document access rules
-- Support document updates, versioning, and incremental re-indexing
-- Measure retrieval and answer quality against a curated evaluation set
-- Provide a React UI for upload, search, answers, and source inspection
-
-## Architecture (target)
-
-```mermaid
-flowchart TD
-    UI[React + TypeScript] --> API[FastAPI]
-    API --> AUTH[Authentication + access policy]
-    API --> INGEST[Ingestion jobs]
-    INGEST --> PARSE[Parsing and normalization]
-    PARSE --> CHUNK[Chunking + provenance]
-    CHUNK --> EMBED[Embedding generation]
-    EMBED --> DB[(Supabase PostgreSQL + pgvector)]
-    API --> QUERY[Query pipeline]
-    QUERY --> FILTER[Authorization-aware filtering]
-    FILTER --> HYBRID[Vector + full-text retrieval]
-    HYBRID --> RERANK[Reranking]
-    RERANK --> CONTEXT[Context assembly]
-    CONTEXT --> LLM[Grounded answer generation]
-    LLM --> ANSWER[Answer + source citations]
-    DB --> HYBRID
-    API --> BLOB[Azure Blob Storage]
-```
-
-**Security principle:** authorization must be applied before any retrieved content is returned to the user or passed to the LLM. Prompt instructions alone are not access control.
-
-## Technology stack (planned)
-
-| Layer | Technologies |
-| --- | --- |
-| Frontend | React, TypeScript, Vite, Tailwind CSS, shadcn/ui |
-| Backend | Python, FastAPI, Pydantic |
-| Retrieval | Custom Python pipeline; PostgreSQL full-text search + pgvector |
-| Reranking | Model/provider to be selected and benchmarked |
-| Embeddings / generation | Model/provider to be selected |
-| Data access | SQLAlchemy 2.x, Alembic |
-| Database | Supabase PostgreSQL + pgvector (schema `knowledge_intelligence`) |
-| Parsing | PyMuPDF, python-docx if DOCX support is added, language-aware text parsing |
-| File storage | Azure Blob Storage |
-| Testing | pytest, Vitest |
-| Quality | Ruff, mypy, ESLint, TypeScript |
-| Infrastructure | Docker, Azure Container Apps, Azure Static Web Apps, Bicep; images on public GHCR |
-| CI/CD | GitHub Actions |
-
-The project will implement core retrieval steps explicitly before deciding whether a framework such as LlamaIndex or LangChain adds enough value.
-
-## Retrieval pipeline (planned)
-
-1. Authenticate the user and determine their authorized scope.
-2. Normalize the query and construct access-aware search filters.
-3. Retrieve candidates through vector similarity and full-text search.
-4. Fuse results and rerank candidate passages.
-5. Build a bounded context containing source identifiers and locations.
-6. Generate an answer grounded in retrieved evidence.
-7. Return citations and handle insufficient evidence explicitly.
-
-For ingestion, each chunk will retain source-document identity, version, and location so citations can be verified and stale chunks replaced.
-
-## Evaluation plan
-
-A small, version-controlled question set will be prepared **before** tuning retrieval. It will include:
-
-- Exact terminology and identifier lookups
-- Semantic paraphrases
-- Questions requiring multiple source passages
-- Similar documents with conflicting versions
-- Questions with no supporting evidence
-- Unauthorized documents that must not appear in retrieval
-
-Planned measurements:
-
-| Area | Candidate metrics |
-| --- | --- |
-| Retrieval | Recall@k, Precision@k, MRR / nDCG |
-| Answers | Citation support, faithfulness, answer correctness |
-| Access control | Unauthorized retrieval rate (target: zero) |
-| Operations | Ingestion duration, query latency, cost per query |
-
-Baselines will compare **keyword search**, **vector-only search**, and **hybrid + reranking** on the same evaluation set. **No benchmark results are claimed yet.**
-
-## Engineering considerations
-
-- **Incremental ingestion:** detect changed files and avoid duplicate chunks.
-- **Versioning:** retain provenance and prevent stale versions from silently dominating results.
-- **ACL:** enforce document-level permissions at retrieval time and test negative cases.
-- **Observability:** record ingestion failures, retrieval timing, selected sources, and token usage without leaking sensitive content.
-- **Reliability:** use bounded retries, idempotent ingestion operations, and explicit failure states.
-- **Security:** treat document contents as untrusted data; defend against prompt injection in retrieved text.
-
-## Development roadmap
-
-- [ ] Bootstrap React, FastAPI, PostgreSQL/pgvector, Docker, and CI
-- [ ] Build document upload and metadata models
-- [ ] Implement PDF/Markdown/C# parsing and chunk provenance
-- [ ] Add embedding generation and vector search baseline
-- [ ] Add full-text search and hybrid result fusion
-- [ ] Add reranking and grounded answer citations
-- [ ] Implement document-level ACL and negative authorization tests
-- [ ] Support incremental ingestion and document version updates
-- [ ] Build evaluation dataset and publish comparative metrics
-- [ ] Deploy live demo with Azure and GitHub Actions
-
-## Local development
-
-```text
-frontend/       # React + TypeScript (Vite)
-backend/        # FastAPI API scaffold
-infra/          # Azure Bicep modules and parameters
-docs/           # Architecture, retrieval experiments, evaluation
-.github/        # CI/CD workflows
-```
-
-### Backend
-
-```bash
-cd backend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app.main:app --reload --port 8000
-```
-
-See [`backend/README.md`](backend/README.md).
-
-### Frontend
-
-```bash
-cd frontend
-cp .env.example .env
-npm install
-npm run dev
-```
-
-See [`frontend/README.md`](frontend/README.md).
-
-### Container App (Azure)
-
-Phase 1 infra does **not** create the Container App. After a public GHCR image exists, set `deployContainerApp = true` + `containerImage` in [`infra/parameters/demo.bicepparam`](infra/parameters/demo.bicepparam) and redeploy. Full steps: [`infra/README.md`](infra/README.md).
-
-## CI/CD and deployment
-
-**Single Azure environment:** public portfolio **demo** only (no separate Azure staging/production yet).
-
-```text
-Local Development → Pull Request CI → Merge to Main → Azure Demo
-```
-
-| Layer | Detail |
-| --- | --- |
-| Azure resource group | `rg-knowledge-intelligence-demo` |
-| Bicep parameters | [`infra/parameters/demo.bicepparam`](infra/parameters/demo.bicepparam) |
-| GitHub Environment | `demo` |
-| Bicep `environment` / tags | `demo` (modules stay reusable for future `staging` / `production` param files) |
-
-Infrastructure as Code: [`infra/`](infra/). Full ops guide: **[`infra/README.md`](infra/README.md)** (Supabase/pgvector, GHCR, secrets, OIDC).
-
-| Workflow | Purpose |
-| --- | --- |
-| `.github/workflows/infra-ci.yml` | Bicep build/lint on `infra/**` (PR / push) |
-| `.github/workflows/infra-cd.yml` | Manual infra deploy to Environment `demo` (`DATABASE_URL`; optional `LLM_API_KEY`) |
-| `.github/workflows/backend-cd.yml` | GHCR build/push + Container App image update |
-| `.github/workflows/frontend-cd.yml` | SWA deploy |
-
-- **Hosting (planned live):** Static Web Apps (`eastasia`), Container Apps + Blob (`australiasoutheast`); DB on Supabase (pgvector, schema `knowledge_intelligence`); images on public GHCR.
-- Independent of Enterprise AI Agent Platform (`rg-knowledge-intelligence-demo` only).
-
-**Live demo:** Coming soon. Public demo will use synthetic corpora, rate limits, and LLM usage caps (see `infra/README.md`). Do not create Azure resources until an explicit deploy is approved.
-
-## Documentation
-
-Design decisions, retrieval experiments, sample datasets, architecture diagrams, and evaluation reports will be published under `docs/` as they become available.
-
-## Data and licensing
-
-This is an independent portfolio project. Public demonstration content will be synthetic, public-domain, or used under an appropriate license. No private corporate repositories or documents will be published.
-
-**License:** To be decided. No license is granted by default until a license file is added.
+- [Backend](backend/) contains the FastAPI service and PostgreSQL connection setup.
+- [Infrastructure](infra/) contains the existing Azure deployment scaffold.
+- [Frontend](frontend/) contains the existing React scaffold. The headless MVP runs independently of it.

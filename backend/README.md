@@ -1,43 +1,49 @@
-# Backend
+# AFLUX Invoice Breakdown Agent backend
 
-FastAPI API for Enterprise Knowledge Intelligence. Images publish to public GHCR as `knowledge-intelligence-api` and run on Azure Container Apps.
+The current FastAPI scaffold exposes `GET /health`. Workbook processing and persistent workflow endpoints are planned. The health endpoint checks that the service responds. Database-backed operations require `DATABASE_URL`, which the database module checks when it is loaded.
 
-## Stack
+## Local startup
 
-- Python 3.12
-- FastAPI + Uvicorn
-- SQLAlchemy 2.x + psycopg (Supabase PostgreSQL / pgvector)
-- Default schema: `knowledge_intelligence`
-
-## Local setup
+From the repository root, with Python 3.12 installed:
 
 ```bash
 cd backend
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# edit DATABASE_URL if you need DB connectivity locally
-uvicorn app.main:app --reload --port 8000
+python -m pip install -r requirements.txt
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
-Health check: `GET http://localhost:8000/health`
+## Docker startup
 
-`DATABASE_URL` is optional for the MVP `/health` endpoint. Importing `app.database` requires it.
-
-## Docker
+From the repository root, with Docker running:
 
 ```bash
-docker build -t knowledge-intelligence-api:local .
-docker run --rm -p 8000:8000 \
-  -e ENVIRONMENT=demo \
-  -e POSTGRES_SCHEMA=knowledge_intelligence \
-  knowledge-intelligence-api:local
+docker build -t knowledge-intelligence-api:local backend
+docker run --rm -p 8000:8000 knowledge-intelligence-api:local
 ```
 
-## Azure / CD
+## Verify startup
 
-1. Push a **public** GHCR image via `backend-cd` (or local `docker push`).
-2. Set `deployContainerApp = true` and `containerImage` in `infra/parameters/demo.bicepparam`.
-3. Redeploy infra with `DATABASE_URL` (and optional `LLM_API_KEY`).
-4. Set GitHub Environment variable `CONTAINER_APP_NAME` from infra outputs for ongoing image updates.
+```bash
+curl --fail --silent --show-error http://localhost:8000/health
+```
+
+Expected response with default settings:
+
+```json
+{
+  "status": "healthy",
+  "service": "knowledge-intelligence-api",
+  "name": "AFLUX Invoice Breakdown Agent",
+  "environment": "development"
+}
+```
+
+The `name` field matches the title shown in the [local API docs](http://localhost:8000/docs). The `service` field retains the identifier used by the existing deployment configuration. Both startup paths can serve this response without a database URL or a local `.env` file.
+
+## Database and deployment
+
+Use [`.env.example`](.env.example) as a template when configuring PostgreSQL. The existing database module uses SQLAlchemy and psycopg with the default schema setting `knowledge_intelligence`.
+
+The existing backend workflow publishes the `knowledge-intelligence-api` image to GHCR and checks `/health` on Azure Container Apps. See the [infrastructure guide](../infra/README.md) for configuration.
