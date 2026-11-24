@@ -2,7 +2,8 @@ from alembic import context
 from sqlalchemy.engine import Engine
 from sqlalchemy.schema import CreateSchema
 
-from app import task_tables, workflow_tables  # Register application tables in the shared metadata.
+# Register application tables in the shared metadata.
+from app import extraction_tables, task_tables, workflow_tables
 from app.config import settings
 from app.database import create_database_engine, metadata
 

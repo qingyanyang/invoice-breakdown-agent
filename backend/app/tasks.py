@@ -14,7 +14,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.operators import Operator
-from app.source_storage import SourceAlreadyExists, SourceStorage, StorageError
+from app.source_storage import (
+    SourceAlreadyExists, SourceIntegrityError, SourceStorage, StorageError, read_verified_source,
+)
 from app.task_tables import task_revisions, tasks
 from app.workbook_upload import XLSX_MEDIA_TYPE, read_upload, validate_filename, validate_workbook
 
@@ -263,11 +265,14 @@ async def read_source(
     if row["source_key"] is None:
         raise HTTPException(404, "Source not found")
     try:
-        data = await to_thread.run_sync(storage_for(request).read, row["source_key"], row["source_size"])
+        data = await to_thread.run_sync(
+            read_verified_source, storage_for(request), row["source_key"],
+            row["source_size"], row["source_sha256"],
+        )
+    except SourceIntegrityError:
+        raise HTTPException(503, "Source integrity check failed") from None
     except StorageError:
         raise HTTPException(503, "Source storage unavailable") from None
-    if len(data) != row["source_size"] or sha256(data).hexdigest() != row["source_sha256"]:
-        raise HTTPException(503, "Source integrity check failed")
     return Response(
         data, media_type=XLSX_MEDIA_TYPE,
         headers={

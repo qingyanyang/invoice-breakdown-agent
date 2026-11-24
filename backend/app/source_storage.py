@@ -1,5 +1,6 @@
 import logging
 import os
+from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Protocol
@@ -18,6 +19,10 @@ class StorageError(RuntimeError):
 
 
 class SourceAlreadyExists(StorageError):
+    pass
+
+
+class SourceIntegrityError(StorageError):
     pass
 
 
@@ -125,3 +130,10 @@ def create_source_storage(config: Settings) -> SourceStorage | None:
     if config.source_storage_directory:
         return LocalSourceStorage(config.source_storage_directory)
     return None
+
+
+def read_verified_source(storage: SourceStorage, key: str, size: int, checksum: str) -> bytes:
+    data = storage.read(key, size)
+    if len(data) != size or sha256(data).hexdigest() != checksum:
+        raise SourceIntegrityError
+    return data
