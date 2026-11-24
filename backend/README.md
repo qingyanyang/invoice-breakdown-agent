@@ -44,6 +44,6 @@ The `name` field matches the title shown in the [local API docs](http://localhos
 
 ## Database and deployment
 
-Use [`.env.example`](.env.example) as a template when configuring PostgreSQL. The existing database module uses SQLAlchemy and psycopg with the default schema setting `knowledge_intelligence`.
+Use [`.env.example`](.env.example) as a template when configuring PostgreSQL. The database module connects using SQLAlchemy and psycopg. `POSTGRES_SCHEMA` is reserved for future use and defaults to `knowledge_intelligence`. The current scaffold leaves the connection search path at the database session default.
 
 The existing backend workflow publishes the `knowledge-intelligence-api` image to GHCR and checks `/health` on Azure Container Apps. See the [infrastructure guide](../infra/README.md) for configuration.
