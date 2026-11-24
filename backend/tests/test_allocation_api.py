@@ -1,4 +1,5 @@
 import asyncio
+from decimal import Decimal
 from uuid import uuid4
 from xml.etree import ElementTree
 from zipfile import ZipFile
@@ -136,3 +137,102 @@ async def test_allocation_policy_updates_are_atomic(task_runtime, configured_ski
         assert success(await client.get(path, headers=ALICE)) == updated
         repeat = {**before, "policy": updated["policy"]}
         assert success(await client.post(path, headers=ALICE, json=repeat)) == updated
+
+
+def allocation_workbook(workbook_with, rows):
+    source_rows = [(description, amount, None) for description, amount, _ in rows]
+    total = sum(Decimal(amount) for _, amount, _ in rows)
+    source_rows.append(("Project Total ex GST", str(total), f"SUM(D4:D{3 + len(rows)})"))
+    worksheet = ElementTree.fromstring(source_sheet(source_rows))
+    row_cells = worksheet.findall(f"{{{SHEET_NS}}}sheetData/{{{SHEET_NS}}}row")
+    for row, label in zip(row_cells, ["Area", *[area for _, _, area in rows]]):
+        coordinate = "E" + row.attrib["r"]
+        cell = ElementTree.SubElement(row, f"{{{SHEET_NS}}}c", r=coordinate, t="inlineStr")
+        inline = ElementTree.SubElement(cell, f"{{{SHEET_NS}}}is")
+        ElementTree.SubElement(inline, f"{{{SHEET_NS}}}t").text = label
+    return workbook_with({WORKSHEET: ElementTree.tostring(worksheet)})
+
+
+async def approve_target(client, workbook, target):
+    task_id = success(await client.post("/tasks", headers=ALICE, json={
+        "target": {"amount": target, "gst_basis": "excluding_gst"},
+    }), 201)["id"]
+    task = f"/tasks/{task_id}"
+    success(await client.put(
+        task + "/source", headers=ALICE, content=workbook,
+        params={"expected_revision": 1, "filename": "allocation.xlsx"},
+    ))
+    await establish_evidence(client, task_id)
+    classified = await reconcile_and_classify(client, task)
+    return task + "/allocation", {**START, "expected_classification_id": classified["proposal_id"]}
+
+
+async def protected_first_model(_settings, _spec, inputs):
+    return model_answer(inputs, {f"{SHEET}!D4": "Make Good"})
+
+
+@pytest.mark.anyio
+async def test_api_persists_blocked_amplification_of_signed_scope(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    async def model(_settings, _spec, inputs):
+        return model_answer(inputs, {})
+
+    monkeypatch.setattr(classification_model, "propose", model)
+    await setup_checkpoints(settings)
+    workbook = allocation_workbook(workbook_with, [
+        ("Miscellaneous work", "100000.00", "Area A"),
+        ("Miscellaneous credit", "-99999.99", "Area B"),
+    ])
+    async with service() as client:
+        path, request = await approve_target(client, workbook, "10000.00")
+        result = success(await client.post(path, headers=ALICE, json=request))
+        assert result["status"] == "blocked"
+        assert result["report"]["issue"]["code"] == "implausible_factor"
+        assert "display" not in result["report"]
+        assert result["report"]["issue"]["evidence"]["proposed_factor"] == "1000000"
+    async with service() as client:
+        assert success(await client.get(path, headers=ALICE)) == result
+
+
+@pytest.mark.anyio
+async def test_api_publishes_distributed_residual_and_protects_amounts(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    monkeypatch.setattr(classification_model, "propose", protected_first_model)
+    await setup_checkpoints(settings)
+    rows = [("Make Good", "100.00", "Protected")]
+    rows.extend(("Miscellaneous work", "0.01", f"Area {index:02}") for index in range(1, 11))
+    async with service() as client:
+        path, request = await approve_target(client, allocation_workbook(workbook_with, rows), "100.05")
+        result = success(await client.post(path, headers=ALICE, json=request))
+        assert result["status"] == "ready_for_workbook"
+        display = result["report"]["display"]
+        assert display["total"] == "100.05"
+        assert display["trade_totals"]["Make Good"] == "100.00"
+        assert display["rounding"]["recipients"] == [
+            {"area": f"Area {index:02}", "trade": "Other", "amount": "-0.01"} for index in range(1, 6)
+        ]
+
+
+@pytest.mark.anyio
+async def test_api_zero_residual_stays_ready_after_preference_update(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    monkeypatch.setattr(classification_model, "propose", protected_first_model)
+    await setup_checkpoints(settings)
+    workbook = allocation_workbook(workbook_with, [
+        ("Make Good", "10.00", "Area A"), ("Miscellaneous work", "1.00", "Area B"),
+    ])
+    async with service() as client:
+        path, request = await approve_target(client, workbook, "10.00")
+        original = success(await client.post(path, headers=ALICE, json=request))
+        assert original["status"] == "ready_for_workbook"
+        preference = {"area": "Area B", "trade": "Other"}
+        updated = success(await client.post(path, headers=ALICE, json={
+            **request, "expected_allocation_id": original["allocation_id"],
+            "policy": {"rounding_preference": preference},
+        }))
+        assert updated["status"] == "ready_for_workbook"
+        assert updated["policy"]["rounding_preference"] == preference
+        assert updated["report"] == original["report"]

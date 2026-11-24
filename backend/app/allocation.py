@@ -12,7 +12,7 @@ from app.reconcile import CENT, amount_text, cents
 from app.reconciliation_evidence import Reference
 from app.reconciliations import SourceKey
 
-ALLOCATION_VERSION = "1"
+ALLOCATION_VERSION = "2"
 PRECISION = 512
 ALLOCATION_CONTEXT = Context(prec=PRECISION, rounding=ROUND_HALF_UP)
 ZERO = Decimal(0)
@@ -60,9 +60,10 @@ assignments_adapter = TypeAdapter(list[Assignment])
 
 
 class AllocationProblem(ValueError):
-    def __init__(self, code: str, detail: str):
+    def __init__(self, code: str, detail: str, evidence: dict | None = None):
         self.code = code
         self.detail = detail
+        self.evidence = evidence
 
 
 def verify_working_scope(reconciliation: dict, classification: dict) -> tuple[list[Assignment], Decimal]:
@@ -155,31 +156,99 @@ def classify_protection(assignment: Assignment, protected_rows: set[str]) -> str
     return "owner_designated" if assignment.row in protected_rows else None
 
 
-def rounding_recipient(cells, delta, displayed_trade, policy, scale):
-    def eligible(key):
-        cell = cells[key]
-        return scale.numerator > ZERO and cell.source.adjustable != ZERO
+def check_amplification(scale: Scale, lines: list[tuple[Assignment, str | None]]) -> None:
+    uplift = scale.numerator - scale.denominator
+    if uplift <= ZERO:
+        return
+    credits = [item for item, protection in lines if protection is None and item.amount < ZERO]
+    credit_magnitude = sum((item.amount.copy_abs() for item in credits), ZERO)
+    # Compare the additional offsetting exposure with the full adjustable target.
+    # Cross-multiplication makes the gate independent of a rounded quotient.
+    if credit_magnitude * uplift > scale.numerator * scale.denominator:
+        projected = scale.amount(credit_magnitude)
+        raise AllocationProblem(
+            "implausible_factor",
+            "The factor increases offsetting credits by more than the authorized adjustable target. "
+            "Review the contributing scope and target before allocation.",
+            {
+                "adjustable_base": amount_text(scale.denominator),
+                "adjustable_target": amount_text(scale.numerator),
+                "proposed_factor": amount_text(scale.amount(ONE)),
+                "source_credit_magnitude": amount_text(credit_magnitude),
+                "projected_credit_magnitude": amount_text(projected),
+                "credit_increase": amount_text(projected - credit_magnitude),
+                "credit_rows": [item.row for item in credits],
+            },
+        )
 
-    if policy.rounding_preference is not None:
-        preferred = policy.rounding_preference.key
-        if preferred not in cells or not eligible(preferred):
-            raise AllocationProblem("ineligible_rounding_preference", "Select a displayed cell with an adjustable amount.")
-        ordered = [preferred]
-    else:
-        # The factor is uniform, so source magnitudes give the same ranking as scaled magnitudes.
-        ordered = sorted((key for key in cells if eligible(key)), key=lambda key: (-cells[key].source.adjustable.copy_abs(), key))
 
+def residual_capacity(cell: RoundedCell, trade_total: Decimal, delta: Decimal) -> Decimal:
+    magnitude = delta.copy_abs()
+    if cell.source.adjustable.is_signed() != delta.is_signed():
+        magnitude = min(magnitude, (cell.adjustable + cell.residual).copy_abs())
+    if delta < ZERO:
+        magnitude = min(magnitude, max(trade_total, ZERO))
+    return magnitude.copy_sign(delta)
+
+
+def apply_rounding_residual(cells, delta, displayed_trade, policy, scale):
     if not delta:
-        return None
+        return []
+
+    eligible = {
+        key for key, cell in cells.items() if scale.numerator > ZERO and cell.source.adjustable != ZERO
+    }
+    preferred = policy.rounding_preference.key if policy.rounding_preference else None
+    if preferred is not None and preferred not in eligible:
+        raise AllocationProblem("ineligible_rounding_preference", "Select a displayed cell with an adjustable amount.")
+    # The factor is uniform, so source magnitudes give the same ranking as scaled magnitudes.
+    ordered = [preferred] if preferred is not None else sorted(
+        eligible, key=lambda key: (-cells[key].source.adjustable.copy_abs(), key),
+    )
+    negative_trades = {trade for trade, amount in displayed_trade.items() if amount < ZERO}
+    remaining = delta
+    recipients = {}
+
+    def apply(key, amount):
+        nonlocal remaining
+        if amount:
+            cells[key].residual += amount
+            displayed_trade[key[1]] += amount
+            remaining -= amount
+            recipients[key] = None
+
     for key in ordered:
-        cell = cells[key]
-        adjusted = cell.adjustable + delta
+        trade_total = displayed_trade[key[1]]
         if (
-            (adjusted == ZERO or adjusted.is_signed() == cell.source.adjustable.is_signed())
-            and displayed_trade[key[1]] + delta >= ZERO
+            negative_trades.issubset({key[1]}) and trade_total + delta >= ZERO
+            and residual_capacity(cells[key], trade_total, delta) == delta
         ):
-            return key
-    raise AllocationProblem("unsafe_rounding_residual", "No eligible component can absorb the residual within its approved sign and trade total.")
+            apply(key, delta)
+            return list(recipients)
+
+    problem = AllocationProblem(
+        "unsafe_rounding_residual",
+        "Eligible components cannot absorb the residual within their approved signs and trade totals.",
+    )
+    minimum = -sum((displayed_trade[trade] for trade in negative_trades), ZERO)
+    if preferred is not None or (negative_trades and minimum > delta):
+        raise problem
+
+    # Reserve any positive residual needed to restore a rounded trade total to zero.
+    for key in ordered:
+        trade_total = displayed_trade[key[1]]
+        if trade_total < ZERO:
+            apply(key, residual_capacity(cells[key], trade_total, -trade_total))
+    if any(displayed_trade[trade] < ZERO for trade in negative_trades):
+        raise problem
+
+    for key in ordered:
+        if not remaining:
+            break
+        apply(key, residual_capacity(cells[key], displayed_trade[key[1]], remaining))
+    if remaining:
+        raise problem
+    return list(recipients)
 
 
 def amount_map(totals: dict) -> dict:
@@ -213,11 +282,8 @@ def build_display(buckets, scale, expected, policy, *, has_target: bool) -> dict
     bound = HALF_CENT * (rounded_count + (not has_target and expected != expected_display))
     if residual.copy_abs() > bound:
         raise AllocationProblem("unexplained_rounding_difference", "The displayed difference exceeds the maximum rounding error.")
-    recipient = None
-    if has_target:
-        recipient = rounding_recipient(cells, residual, displayed_trade, policy, scale)
-        if recipient is not None:
-            cells[recipient].residual = residual
+    recipients = apply_rounding_residual(cells, residual, displayed_trade, policy, scale) if has_target else []
+    applied = sum((cells[key].residual for key in recipients), ZERO)
 
     displayed_area = defaultdict(Decimal)
     displayed_trade.clear()
@@ -238,6 +304,7 @@ def build_display(buckets, scale, expected, policy, *, has_target: bool) -> dict
                 "adjustable_base": amount_text(cell.source.adjustable),
                 "adjustable_display_before_residual": amount_text(cell.adjustable),
                 "adjustable_display": amount_text(cents(cell.adjustable + cell.residual)),
+                "rounding_residual": amount_text(cents(cell.residual)),
                 "display_total": amount_text(cents(cell.total)),
             }
             for (area, trade), cell in cells.items()
@@ -251,9 +318,13 @@ def build_display(buckets, scale, expected, policy, *, has_target: bool) -> dict
             "rounded_component_count": rounded_count, "maximum_difference": amount_text(bound),
             "comparison_total": amount_text(expected_display), "before_residual": amount_text(cents(before)),
             "residual_required": amount_text(cents(residual)),
-            "residual_applied": amount_text(cents(residual if recipient is not None else ZERO)),
-            "recipient": {"area": recipient[0], "trade": recipient[1]} if recipient is not None else None,
-            "note": "rounding residual applied" if recipient is not None else None,
+            "residual_applied": amount_text(cents(applied)),
+            "recipient": {"area": recipients[0][0], "trade": recipients[0][1]} if len(recipients) == 1 else None,
+            "recipients": [
+                {"area": area, "trade": trade, "amount": amount_text(cents(cells[area, trade].residual))}
+                for area, trade in recipients
+            ],
+            "note": "rounding residual applied" if recipients else None,
             "difference": amount_text(difference),
         },
     }
@@ -279,10 +350,10 @@ def allocate(
             assignments, working = verify_working_scope(reconciliation, classification)
             return {**report, **allocate_working_scope(assignments, working, target, policy)}
     except AllocationProblem as error:
-        return {
-            **report, "status": "blocked", "factor": None,
-            "issue": {"code": error.code, "detail": error.detail},
-        }
+        issue = {"code": error.code, "detail": error.detail}
+        if error.evidence is not None:
+            issue["evidence"] = error.evidence
+        return {**report, "status": "blocked", "factor": None, "issue": issue}
 
 
 def allocate_working_scope(assignments, working, target, policy):
@@ -305,6 +376,8 @@ def allocate_working_scope(assignments, working, target, policy):
     protected = sum(protected_by_origin.values(), ZERO)
     base = working - protected
     scale = choose_scale(target, protected, base) if target is not None else None
+    if scale is not None:
+        check_amplification(scale, lines)
     effective_scale = scale or IDENTITY
     direction = None
     if target is not None:

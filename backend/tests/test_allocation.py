@@ -186,3 +186,62 @@ def test_excessive_difference_blocks_publication(monkeypatch):
 @pytest.mark.parametrize("amount,expected", [("0.03", "0.01"), ("-0.03", "-0.01")])
 def test_half_up_uses_exact_tie_even_with_recurring_factor(amount, expected):
     assert Scale(Decimal(1), Decimal(6)).rounded(Decimal(amount)) == Decimal(expected)
+
+
+def test_amplification_of_offsetting_credits_blocks_before_final_amounts():
+    lines = [line(4, "100000.00", area="Area A"), line(5, "-99999.99", area="Area B")]
+    result = decision(lines, Decimal("10000.00"))
+    assert result["status"] == "blocked" and result["factor"] is None
+    assert "display" not in result and "assignments" not in result
+    assert result["issue"]["code"] == "implausible_factor"
+    evidence = result["issue"]["evidence"]
+    assert Decimal(evidence["proposed_factor"]) == Decimal("1000000")
+    assert evidence["adjustable_base"] == "0.01"
+    assert evidence["source_credit_magnitude"] == "99999.99"
+    assert evidence["credit_rows"] == ["Trade Summary!D5"]
+
+    ordinary = decision([line(4, "300"), line(5, "-200")], Decimal("101.00"))
+    assert ordinary["status"] == "ready_for_workbook"
+
+
+def test_automatic_residual_spills_in_stable_order_without_crossing_zero():
+    protected = line(20, "100", trade="Make Good")
+    lines = [line(row, "0.01", area=f"Area {row:02}") for row in range(4, 14)] + [protected]
+    report = decision(list(reversed(lines)), Decimal("100.05"))
+    assert report["status"] == "ready_for_workbook"
+    assert Decimal(report["factor"]["decimal"]) == Decimal("0.5")
+    rounding = report["display"]["rounding"]
+    assert rounding["recipient"] is None
+    assert rounding["recipients"] == [
+        {"area": f"Area {row:02}", "trade": "Other", "amount": "-0.01"} for row in range(4, 9)
+    ]
+    assert rounding["residual_applied"] == "-0.05" and rounding["difference"] == "0.00"
+    assert report["display"]["trade_totals"] == {"Make Good": "100.00", "Other": "0.05"}
+    assert all(Decimal(cell["adjustable_display"]) >= 0 for cell in report["display"]["cells"])
+
+
+def test_zero_factor_ignores_rounding_preference_without_a_residual():
+    report = decision(
+        [line(4, "10", trade="Make Good"), line(5, "1")], Decimal("10.00"),
+        rounding_preference={"area": "Additional Items", "trade": "Other"},
+    )
+    assert report["status"] == "ready_for_workbook"
+    assert Decimal(report["factor"]["decimal"]) == 0
+    rounding = report["display"]["rounding"]
+    assert rounding["residual_applied"] == "0.00" and rounding["recipients"] == []
+
+
+def test_positive_residual_repairs_multiple_rounded_trade_totals():
+    lines = [
+        line(4, "-0.006", "Doors", "Area A"), line(5, "0.003", "Doors", "Area B"),
+        line(6, "0.003", "Doors", "Area C"), line(7, "-0.006", "Other", "Area D"),
+        line(8, "0.003", "Other", "Area E"), line(9, "0.003", "Other", "Area F"),
+        line(10, "0.01", "Glazing", "Area G"),
+    ]
+    result = decision(lines, Decimal("0.01"))
+    assert result["status"] == "ready_for_workbook"
+    assert result["display"]["trade_totals"] == {"Doors": "0.00", "Glazing": "0.01", "Other": "0.00"}
+    assert result["display"]["rounding"]["recipients"] == [
+        {"area": "Area A", "trade": "Doors", "amount": "0.01"},
+        {"area": "Area D", "trade": "Other", "amount": "0.01"},
+    ]

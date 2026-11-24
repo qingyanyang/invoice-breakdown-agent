@@ -351,16 +351,23 @@ ROUND_HALF_UP. The adjustable rounding uses the exact quotient of the factor's
 numerator and denominator to resolve ties. The maximum legitimate target
 residual is half a cent multiplied by the number of nonzero rounded components.
 The exact total must already reconcile before a residual can be applied.
-Use the eligible requested cell or the largest adjustable magnitude, with
-ties ordered by the area label and trade name. The residual changes only the
-adjustable display component and must preserve its sign or bring it to zero.
-Area, trade and grand totals all derive from those same displayed cells.
-A targeted result requires a displayed difference of `0.00`.
+Use an eligible requested cell for a nonzero residual, or try the largest
+adjustable magnitude first, with ties ordered by area label and trade name.
+If no single cell can absorb it in automatic mode, distribute it in that
+order and record the amount applied to each recipient. Positive residuals
+first cover any negative displayed trade totals. Each adjustment changes
+only the adjustable display component and must preserve its sign or bring
+it to zero. A zero residual needs no recipient. Area, trade and grand totals
+all derive from the same displayed cells. A targeted result requires a
+displayed difference of `0.00`.
 
 An unconfirmed GST basis returns a workflow prerequisite. A target that needs
 a verified GST conversion, cannot cover protected amounts, or cannot be
 achieved under the current rules produces a blocked report with its cause.
-An opposite requested direction is recorded as a warning. A task with no
+An increase pauses for scope review if scaling the adjustable credits
+would increase their magnitude by more than the entire authorized
+adjustable target. The blocked report records the proposed factor and
+source credit evidence. An opposite requested direction is recorded as a warning. A task with no
 target records `no_contract_price_adjustment` and a null factor. Its exact
 assignments pass through, and any two-decimal display discrepancy is recorded
 under source presentation rounding without applying a contract adjustment.
