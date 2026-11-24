@@ -17,6 +17,7 @@ from app.database import (
 from app.extractions import SourceReadWorker
 from app.extractions import router as extraction_router
 from app.operators import operator_credentials
+from app.reconciliations import router as reconciliation_router
 from app.source_storage import create_source_storage
 from app.tasks import router as task_router
 from app.workflows import router as workflow_router
@@ -63,6 +64,7 @@ app = FastAPI(
 app.include_router(task_router)
 app.include_router(workflow_router)
 app.include_router(extraction_router)
+app.include_router(reconciliation_router)
 
 origins = [
     origin.strip()
