@@ -39,6 +39,10 @@ param llmApiKey string = ''
 @description('When true, declare ACA secret llm-api-key and env LLM_API_KEY. Do not use empty() on @secure() params — ARM cannot reliably test them.')
 param enableLlmApiKey bool = false
 
+@secure()
+param operatorTokens string = ''
+param enableOperatorTokens bool = false
+
 @description('Container listen port.')
 param containerPort int = 8000
 
@@ -81,6 +85,20 @@ var llmSecret = enableLlmApiKey ? [
   {
     name: 'llm-api-key'
     value: llmApiKey
+  }
+] : []
+
+var operatorSecret = enableOperatorTokens ? [
+  {
+    name: 'operator-tokens'
+    value: operatorTokens
+  }
+] : []
+
+var operatorEnv = enableOperatorTokens ? [
+  {
+    name: 'OPERATOR_TOKENS'
+    secretRef: 'operator-tokens'
   }
 ] : []
 
@@ -158,7 +176,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           }
         ]
       }
-      secrets: concat(databaseSecret, llmSecret)
+      secrets: concat(databaseSecret, llmSecret, operatorSecret)
     }
     template: {
       containers: [
@@ -204,7 +222,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               timeoutSeconds: 5
             }
           ]
-          env: concat(baseEnv, llmEnv)
+          env: concat(baseEnv, llmEnv, operatorEnv)
         }
       ]
       scale: {

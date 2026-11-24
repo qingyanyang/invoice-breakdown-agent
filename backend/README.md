@@ -1,6 +1,6 @@
 # AFLUX Invoice Breakdown Agent backend
 
-FastAPI exposes `GET /health` for liveness and `GET /ready` for database readiness. Workbook processing and persistent workflow endpoints are planned.
+FastAPI exposes `GET /health` for liveness and `GET /ready` for database readiness. The task API persists source uploads and input revisions. Workbook processing is planned.
 
 ## Local startup
 
@@ -58,7 +58,7 @@ python -m uvicorn app.main:app --reload --port 8000
 
 See [`.env.example`](.env.example) for variable names. Use a `postgresql+psycopg://` URL for Supabase's direct connection or session pooler. The migration role needs permission to create the schema on an empty database and create objects in it. Use session-mode connections because the backend sets a per-connection search path.
 
-Alembic and the backend use the same `DATABASE_URL` and `POSTGRES_SCHEMA` settings. Alembic creates the configured schema before initializing its version table, and connections set their search path to that schema. The baseline creates no application tables. Future ORM tables should use `app.database.metadata` and refer to related tables in that same metadata.
+Alembic and the backend use the same `DATABASE_URL` and `POSTGRES_SCHEMA` settings. Alembic creates the configured schema before initializing its version table, and connections set their search path to that schema. The baseline remains intact. The next migration creates the task and input revision tables in the configured schema.
 
 After migration and startup, check database readiness:
 
@@ -80,6 +80,64 @@ disposes of the connection pool on shutdown. Run
 migrations explicitly before starting database-backed operations.
 
 LangGraph checkpoint setup and workflow resume are tracked in issue #5.
+
+## Task API and source storage
+
+Configure `OPERATOR_TOKENS` as a JSON object mapping operator IDs to distinct
+random URL-safe bearer tokens of at least 32 characters. Keep the values in
+your private `.env` or the deployment secret. The API derives ownership from
+the authenticated operator. Unconfigured authentication disables the task API.
+
+On Azure Container Apps, sources go to the existing private Blob container
+configured by `AZURE_STORAGE_BLOB_ENDPOINT` and
+`AZURE_STORAGE_DOCUMENTS_CONTAINER`. The application uses the existing
+user-assigned managed identity identified by `AZURE_CLIENT_ID`. If the identity
+cannot write blobs, check its Blob Data Contributor assignment. Supply
+`OPERATOR_TOKENS` as a protected `demo` environment secret for an approved
+infrastructure deployment.
+
+For local development, set `SOURCE_STORAGE_DIRECTORY` to a private directory.
+For Docker, mount a persistent volume there if using filesystem storage.
+Azure Blob takes precedence when its endpoint is configured. With neither
+backend configured, source uploads and retrieval return HTTP 503.
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /tasks` | JSON with optional `target`. Creates a task at revision 1. |
+| `GET /tasks/{id}` | Reads the operator's current task revision. |
+| `PUT /tasks/{id}/source?expected_revision=1&filename=source.xlsx` | Sends the raw workbook bytes as the request body. A successful upload creates a new revision. |
+| `GET /tasks/{id}/source` | Downloads the current source. Use `?revision=N` to retrieve that task's earlier source. |
+| `PUT /tasks/{id}/target` | JSON with `expected_revision` and a `target` object or null. A changed target creates a new revision. |
+
+All routes require an `Authorization: Bearer` header. Supply a target such as
+`{"amount":"125.00","gst_basis":"unknown"}`. Use `excluding_gst` or
+`including_gst` only when confirmed. The server stores the amount as a decimal,
+and `unknown` remains available for later clarification. Send the latest
+`expected_revision` on every change. Concurrent attempts on the same revision
+produce one successful change, and stale attempts return HTTP 409. The new
+revision has its own identity for future confirmations, calculations and QA.
+
+Uploads accept `.xlsx` up to 10 MiB with up to 64 MiB of ZIP content after
+expansion. The API rejects corrupt packages, encrypted workbooks and macro
+content. Legacy `.xls` import is deferred and returns HTTP 415. Source validation
+opens the package without executing formulas, running macros, or following
+external links.
+
+Each accepted upload is stored under a new key. Source retrieval checks its
+size and SHA-256. If publication fails, cleanup checks PostgreSQL under the
+task lock and deletes the object only if no revision references it. If cleanup
+cannot confirm that, the service logs the storage key and leaves the object.
+After recovery, use the same database and storage settings to check a logged
+key or an object suspected of being left behind after a worker crash:
+
+```bash
+python -m app.source_cleanup 'sources/<task-id>/<file-id>.xlsx'
+```
+
+The command preserves objects referenced by any revision, including old
+revisions. If a filesystem staging file could not be removed, pass the exact
+`.staging` key from the logs to the same command. Use the original filesystem
+storage and database for that cleanup.
 
 ## Tests
 
