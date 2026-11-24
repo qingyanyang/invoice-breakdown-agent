@@ -160,6 +160,8 @@ async def answer_reconciliation(
         ) if current else None
         if question is None:
             raise HTTPException(409, "Question is no longer pending on this revision")
+        if question.get("response_type") == "source_correction":
+            raise HTTPException(422, "Upload corrected source evidence on a new revision")
         if payload.answer not in question["options"]:
             raise HTTPException(422, "Select one of the offered reconciliation answers")
         decisions = dict(current.decisions)

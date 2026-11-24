@@ -28,13 +28,13 @@ def success(response, status=200):
     return response.json()
 
 
-async def create_source(client, filename):
+async def create_source(client, filename, workbook=None):
     task = success(await client.post("/tasks", headers=ALICE, json={}), 201)
     task_id = task["id"]
     source = success(await client.put(
         f"/tasks/{task_id}/source",
         params={"expected_revision": 1, "filename": filename},
-        content=(FIXTURES / filename).read_bytes(),
+        content=workbook if workbook is not None else (FIXTURES / filename).read_bytes(),
         headers=ALICE,
     ))
     assert source["revision"] == 2
@@ -109,3 +109,36 @@ async def test_reconciliation_publishes_a_verified_control_with_exact_source(tas
         )
         assert len(record["report"]["selected_rows"]) == 6
         assert record["report"]["working_scope_total"] == "260.00"
+
+
+@pytest.mark.anyio
+async def test_material_difference_requires_corrected_workbook(task_runtime, workbook_with):
+    await setup_checkpoints(settings)
+    source = workbook_with({"xl/worksheets/sheet1.xml": b"""
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+<row r="3"><c r="A3" t="inlineStr"><is><t>Description</t></is></c>
+<c r="D3" t="inlineStr"><is><t>Amount</t></is></c></row>
+<row r="4"><c r="A4" t="inlineStr"><is><t>Base work</t></is></c><c r="D4"><v>125</v></c></row>
+<row r="5"><c r="A5" t="inlineStr"><is><t>Project Total ex GST</t></is></c>
+<c r="D5"><f>D4</f><v>100</v></c></row>
+</sheetData></worksheet>"""})
+    async with service() as client:
+        task_id = await create_source(client, "mismatched.xlsx", source)
+        await establish_evidence(client, task_id)
+        path = f"/tasks/{task_id}/reconciliation"
+        record = success(await client.post(path, headers=ALICE, json={"expected_revision": 2}))
+        report = record["report"]
+        assert record["status"] == "blocked" and report["difference"] == "25.00"
+        assert report["working_scope_total"] is None
+        question, = report["questions"]
+        assert question["response_type"] == "source_correction"
+        assert question["options"] == []
+        assert "Trade Summary!D5" in question["prompt"]
+        assert question["evidence"] == [{"sheet": "Trade Summary", "cell": "D5"}]
+        assert "detail and subtotal evidence" in question["required_evidence"]
+        answer = await client.post(path + "/answers", headers=ALICE, json={
+            "expected_revision": 2, "question_id": question["id"], "answer": "confirmed",
+        })
+        assert answer.status_code == 422
+        assert "corrected source evidence" in answer.json()["detail"]
+        assert success(await client.get(path, headers=ALICE)) == record

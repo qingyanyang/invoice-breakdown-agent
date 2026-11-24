@@ -225,8 +225,12 @@ A scope object accepts `mode` equal to `source` or `base_only`. In source mode,
 accepts traced source references, such as `Trade Summary!D10`. Base-only mode
 removes Option, Removal, and Deletion contributions. Their labels identify
 scope candidates. The workbook dependency trace or an explicit source-scope
-answer establishes whether the reported Total includes them. The signed
-amount and its effect on the bridge are stored separately.
+answer establishes whether the reported Total includes them, including rows
+listed after a literal Total. Exclusions explicitly documented on a source
+row are recorded with their provenance. The signed amount and its effect on
+the bridge are stored separately. An authorized addition needs evidence or
+clarification of its GST basis before it can enter the working scope. A
+conflicting GST basis blocks advancement.
 
 The control total uses explicit project-total labels and separates known
 sheet subtotals, alternatives, and GST-inclusive totals. Equally plausible
@@ -246,7 +250,9 @@ to cents using ROUND_HALF_UP for the gate. Round the working scope only
 after applying the signed additions and exclusions. The report reaches
 `ready_for_classification` only when the cent difference is zero, the source
 basis and contribution evidence are established, and no unresolved
-questions or issues remain.
+questions or issues remain. A cent-level mismatch produces a
+`source_correction` question naming the control cell and the evidence needed.
+That question requires a corrected source upload and a new revision.
 
 For the synthetic reconciliation fixture, D12 references D6, D9, D10 and D11.
 D6 contributes D4 (B4 × 1.10 = 110.00) and D5 (B5 × 1.10 = 55.00).

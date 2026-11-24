@@ -4,8 +4,8 @@ from decimal import Decimal, ROUND_HALF_UP, localcontext
 from math import prod
 
 from app.reconciliation_evidence import (
-    MAX_REFERENCES, Reference, SourceRow, WorkbookEvidence, additive_references, markup_recipe,
-    numeric, quantity_rate_recipe, tax_basis, total_kind,
+    MAX_REFERENCES, Reference, SourceRow, WorkbookEvidence, additive_references, explicitly_outside_total, markup_recipe,
+    numeric, quantity_rate_recipe, stated_tax_bases, tax_basis, total_kind,
 )
 
 CENT = Decimal("0.01")
@@ -14,6 +14,7 @@ QUESTION_PROMPTS = {
     "source_gst_basis": "What GST basis applies to this source control total?",
     "source_inclusion": "Does the reported source control include this signed scope row?",
     "markup_treatment": "Does this recorded source amount already include the listed markup?",
+    "scope_addition_gst_basis": "What GST basis applies to this outside-scope addition?",
 }
 ISSUE_DETAILS = {
     "missing_source_control": "A final source Total could not be identified.",
@@ -29,6 +30,7 @@ ISSUE_DETAILS = {
     "control_total_discrepancy": "The independent total differs from the reported Total at cent precision. Supply corrected source evidence.",
     "missing_independent_total": "An independent control amount could not be established.",
     "mixed_contributing_gst_bases": "A contributing amount explicitly uses a different GST basis from the source control.",
+    "scope_addition_gst_basis_mismatch": "This addition and the source control use different GST bases.",
 }
 
 
@@ -83,15 +85,16 @@ class Reconciliation:
 
     def source_basis(self, row: SourceRow) -> tuple[str | None, str | None]:
         sources = dict(self.workbook.basis_evidence)
-        if explicit := tax_basis(row.description):
-            sources[row.label] = explicit
-        meanings = set(sources.values())
+        stated = stated_tax_bases(row.description)
+        meanings = set(sources.values()) | stated
         if len(meanings) == 1:
             return meanings.pop(), "workbook"
         answer = self.ask(
             "source_gst_basis", row.amount, ["excluding_gst", "including_gst"],
-            [{"reference": ref.evidence(), "gst_basis": basis} for ref, basis in sources.items()]
-            or [row.amount.evidence()],
+            [
+                *[{"reference": ref.evidence(), "gst_basis": basis} for ref, basis in sources.items()],
+                *[{"reference": row.label.evidence(), "gst_basis": basis} for basis in sorted(stated)],
+            ] or [row.amount.evidence()],
         )
         return answer, "operator_confirmed" if answer else None
 
@@ -230,37 +233,51 @@ class Reconciliation:
             return None
         return self.select_leaf(row, sign, parent, "source_formula", inherited_scope)
 
-    def trace_literal_total(self, control: SourceRow) -> tuple[Decimal | None, set[Reference]]:
+    def trace_literal_total(
+        self, control: SourceRow, source_rows: list[SourceRow],
+    ) -> tuple[Decimal | None, dict[Reference, str]]:
         tables = [table for table in self.workbook.tables if any(row.amount == control.amount for row in table)]
         if len(tables) != 1:
             self.issue("unresolved_hierarchy", [control.amount])
-            return None, set()
-        omitted = set()
+            return None, {}
+
+        omitted = {}
         values = []
         for row in tables[0]:
             if row.amount == control.amount:
                 break
+            if row.scope_kind:
+                continue
             if total_kind(row.description, row.amount.sheet) in {"subtotal", "total", "project"}:
                 self.issue("unresolved_hierarchy", [control.amount, row.amount])
-                return None, omitted
-            if row.scope_kind:
-                inclusion = self.ask(
-                    "source_inclusion", row.amount, ["included", "excluded"],
-                    [row.amount.evidence(), control.amount.evidence()],
-                )
-                if not inclusion:
-                    values.append(None)
-                    continue
-                if inclusion == "excluded":
-                    omitted.add(row.amount)
-                    continue
-                reason = "operator_confirmed_source_inclusion"
-            else:
-                reason = "flat_table_before_control"
-            values.append(self.select_leaf(row, 1, control.amount, reason))
-        return (sum(values, Decimal(0)) if values and all(value is not None for value in values) else None), omitted
+                values.append(None)
+                continue
+            values.append(self.select_leaf(row, 1, control.amount, "flat_table_before_control"))
 
-    def check_coverage(self, source_rows: list[SourceRow], declared: bool, omitted: set[Reference]) -> list[dict]:
+        # The row order alone does not establish the contribution of signed scope candidates.
+        for row in source_rows:
+            if row.scope_kind is None:
+                continue
+            if explicitly_outside_total(row.description):
+                omitted[row.amount] = "explicit_source_total_exclusion"
+                continue
+            inclusion = self.ask(
+                "source_inclusion", row.amount, ["included", "excluded"],
+                [row.amount.evidence(), control.amount.evidence()],
+            )
+            if inclusion == "excluded":
+                omitted[row.amount] = "operator_confirmed_source_exclusion"
+            elif inclusion is None:
+                values.append(None)
+            elif total_kind(row.description, row.amount.sheet) is not None:
+                self.issue("unresolved_hierarchy", [control.amount, row.amount])
+                values.append(None)
+            else:
+                values.append(self.select_leaf(row, 1, control.amount, "operator_confirmed_source_inclusion"))
+        total = sum(values, Decimal(0)) if values and all(value is not None for value in values) else None
+        return total, omitted
+
+    def check_coverage(self, source_rows: list[SourceRow], declared: bool, omitted: dict[Reference, str]) -> list[dict]:
         outside = []
         untraced = []
         traced_groups = {Reference.from_dict(group["reference"]) for group in self.groups}
@@ -271,7 +288,7 @@ class Reconciliation:
                 outside.append({
                     "reference": row.amount.evidence(), "description": row.description,
                     "scope_kind": row.scope_kind,
-                    "reason": "not_referenced_by_source_total" if declared else "operator_confirmed_source_exclusion",
+                    "reason": "not_referenced_by_source_total" if declared else omitted[row.amount],
                 })
             elif not row.scope_kind:
                 untraced.append(row.amount)
@@ -292,7 +309,60 @@ class Reconciliation:
         if conflicts:
             self.issue("mixed_contributing_gst_bases", conflicts)
 
-    def bridge(self, scope: dict, outside: list[dict]) -> tuple[list[dict], list[dict], Decimal]:
+    def addition_basis(
+        self, row: SourceRow, control: SourceRow, source_basis: str | None,
+    ) -> tuple[str | None, str | None]:
+        if source_basis is None:
+            return None, None
+
+        stated = stated_tax_bases(row.description)
+        basis = next(iter(stated)) if len(stated) == 1 else None
+        origin = "workbook"
+        if basis is None:
+            same_sheet = {
+                ref: value for ref, value in self.workbook.basis_evidence.items()
+                if ref.sheet == row.amount.sheet
+            }
+            meanings = set(same_sheet.values())
+            if not stated and len(meanings) == 1:
+                basis = meanings.pop()
+            else:
+                basis = self.ask(
+                    "scope_addition_gst_basis", row.amount, ["excluding_gst", "including_gst"],
+                    [row.amount.evidence(), control.amount.evidence(), *[
+                        {"reference": ref.evidence(), "gst_basis": value}
+                        for ref, value in same_sheet.items()
+                    ], *[
+                        {"reference": row.label.evidence(), "gst_basis": value}
+                        for value in sorted(stated)
+                    ]],
+                )
+                origin = "operator_confirmed"
+        if basis is None:
+            return None, None
+        if basis != source_basis:
+            self.issue("scope_addition_gst_basis_mismatch", [row.amount, control.amount])
+            return None, None
+        return basis, origin
+
+    def require_control_correction(self, control: SourceRow, reported: Decimal, independent: Decimal) -> None:
+        self.issue("control_total_discrepancy", [control.amount])
+        self.questions.append({
+            "key": f"source_total_correction:{control.amount.key}",
+            "kind": "source_total_correction",
+            "prompt": (
+                f"Can you supply corrected source evidence for {control.amount.key}? "
+                f"The workbook reports {cents(reported):f}, and the traced rows total {cents(independent):f}."
+            ),
+            "required_evidence": "Upload a corrected workbook with the final Total and the detail and subtotal evidence that supports it.",
+            "response_type": "source_correction",
+            "options": [],
+            "evidence": [control.amount.evidence()],
+        })
+
+    def bridge(
+        self, scope: dict, outside: list[dict], control: SourceRow, source_basis: str | None,
+    ) -> tuple[list[dict], list[dict], Decimal]:
         selected = {ref.key: (ref, item) for ref, item in self.selected.items()}
         outside_rows = {Reference.from_dict(item["reference"]).key: item for item in outside}
         exclusions, additions = [], []
@@ -330,6 +400,9 @@ class Reconciliation:
                     "evidence": [ref.evidence()],
                 })
                 continue
+            gst_basis, gst_origin = self.addition_basis(source_row, control, source_basis)
+            if gst_basis is None:
+                continue
             amount, markup, inputs = self.leaf(source_row)
             if amount is not None:
                 delta += amount
@@ -337,6 +410,7 @@ class Reconciliation:
                     "reference": ref.evidence(), "description": candidate["description"],
                     "source_amount": amount_text(amount), "effect": amount_text(amount),
                     "reason": "operator_authorized_addition", "markup_treatment": markup,
+                    "gst_basis": gst_basis, "gst_basis_origin": gst_origin,
                     "markup_evidence": [item.evidence() for item in inputs],
                 })
         return additions, exclusions, delta
@@ -359,21 +433,22 @@ def reconcile(extraction: dict, scope: dict, answers: dict) -> dict:
             if recorded is None:
                 run.issue("missing_reported_total", [row.amount])
             declared = cell.get("formula") is not None
-            omitted = set()
+            source_rows = list(evidence.detail_rows())
+            omitted = {}
             if declared:
                 independent = run.trace(row.amount)
             else:
-                independent, omitted = run.trace_literal_total(row)
-            outside = run.check_coverage(list(evidence.detail_rows()), declared and independent is not None, omitted)
+                independent, omitted = run.trace_literal_total(row, source_rows)
+            outside = run.check_coverage(source_rows, declared and independent is not None, omitted)
             run.check_contributing_basis(row, gst_basis)
             if independent is not None and recorded is not None:
                 exact_difference = independent - recorded
                 difference = cents(independent) - cents(recorded)
                 if difference:
-                    run.issue("control_total_discrepancy", [row.amount])
+                    run.require_control_correction(row, recorded, independent)
             if independent is None and not run.questions and not run.issues:
                 run.issue("missing_independent_total", [row.amount])
-            additions, exclusions, delta = run.bridge(scope, outside)
+            additions, exclusions, delta = run.bridge(scope, outside, row, gst_basis)
             if not run.issues and not run.questions and independent is not None:
                 working = cents(independent + delta)
 

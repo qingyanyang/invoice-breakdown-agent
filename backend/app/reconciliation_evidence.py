@@ -13,23 +13,43 @@ REF_TOKEN = re.compile(REFERENCE)
 NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]{1,3})?")
 SCOPE = re.compile(r"^(option|removal|deletion)\b", re.IGNORECASE)
 MAX_REFERENCES = 10_000
+OUTSIDE_TOTAL = re.compile(
+    r"(?:excluded from|not included in|outside) (?:the )?"
+    r"(?:(?:reported )?(?:source|project|control|final) )total"
+)
 
 
 def clean(value: str | None) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).split())
 
 
-def tax_basis(value: str | None) -> str | None:
+def stated_tax_bases(value: str | None) -> set[str]:
     words = clean(value)
+    bases = set()
     if re.search(r"\b(?:ex|excl|excluding|exclusive of) gst\b", words):
-        return "excluding_gst"
+        bases.add("excluding_gst")
     if re.search(r"\b(?:inc|incl|including|inclusive of) gst\b", words):
-        return "including_gst"
-    return None
+        bases.add("including_gst")
+    return bases
+
+
+def tax_basis(value: str | None) -> str | None:
+    bases = stated_tax_bases(value)
+    return bases.pop() if len(bases) == 1 else None
+
+
+def source_label_parts(value: str) -> list[str]:
+    return [clean(part) for part in re.split(r"[():;–—]|\s-\s", value)]
+
+
+def explicitly_outside_total(value: str) -> bool:
+    return any(OUTSIDE_TOTAL.fullmatch(part) for part in source_label_parts(value))
 
 
 def total_kind(value: str, sheet: str = "") -> str | None:
-    words = clean(value)
+    words = " ".join(
+        part for part in source_label_parts(value) if part and not OUTSIDE_TOTAL.fullmatch(part)
+    )
     if re.search(r"\b(?:subtotal|sub total|sheet total|worksheet total|area total|trade total|section total)\b", words):
         return "subtotal"
     if "total" not in words.split():

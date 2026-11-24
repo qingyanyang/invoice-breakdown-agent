@@ -88,7 +88,7 @@ def test_options_and_signed_scope_bridge(workbook_with):
         ("Option: extra area subtotal", "10", "SUM(D5:D6)"),
         ("Removal: Door credit", "-12", None),
         ("Deletion: Allowance", "5", None),
-        ("Option: Unpriced initial scope alternative", "8", None),
+        ("Option: Initial scope alternative ex GST", "8", None),
         ("Project Total ex GST", "103", "D4+D7+D8+D9"),
     ])
     report = reconcile(evidence, BASE, {})
@@ -172,3 +172,78 @@ def test_mixed_contributing_gst_bases_block_even_with_matching_total(workbook_wi
     assert report["difference"] == "0.00"
     assert report["status"] == "blocked"
     assert any(issue["code"] == "mixed_contributing_gst_bases" for issue in report["issues"])
+
+
+def test_gst_inclusive_addition_cannot_enter_ex_gst_working_scope(workbook_with):
+    evidence = evidence_for(workbook_with, [
+        ("Base work", "100", None),
+        ("Project Total ex GST", "100", "D4"),
+        ("Option: Additional work incl GST", "11", None),
+    ])
+    report = reconcile(evidence, {**SOURCE, "include": ["Trade Summary!D6"]}, {})
+    assert report["status"] == "blocked" and report["difference"] == "0.00"
+    assert report["working_scope_total"] is None and report["scope_additions"] == []
+    issue, = report["issues"]
+    assert issue["code"] == "scope_addition_gst_basis_mismatch"
+    assert issue["evidence"] == [
+        {"sheet": "Trade Summary", "cell": "D6"},
+        {"sheet": "Trade Summary", "cell": "D5"},
+    ]
+
+
+def test_addition_without_gst_evidence_requires_its_own_answer(workbook_with):
+    evidence = evidence_for(workbook_with, [
+        ("Base work", "100", None),
+        ("Project Total ex GST", "100", "D4"),
+        ("Option: Additional work", "11", None),
+    ])
+    scope = {**SOURCE, "include": ["Trade Summary!D6"]}
+    report = reconcile(evidence, scope, {})
+    assert report["status"] == "blocked" and report["scope_additions"] == []
+    question, = report["questions"]
+    assert question["kind"] == "scope_addition_gst_basis"
+    conflicted = reconcile(evidence, scope, {question["key"]: "including_gst"})
+    assert conflicted["status"] == "blocked" and conflicted["scope_additions"] == []
+    ready = reconcile(evidence, scope, {question["key"]: "excluding_gst"})
+    assert ready["status"] == "ready_for_classification"
+    assert ready["working_scope_total"] == "111.00"
+    assert ready["scope_additions"][0]["gst_basis_origin"] == "operator_confirmed"
+
+
+def test_offsetting_scope_after_literal_total_needs_inclusion_evidence(workbook_with):
+    evidence = evidence_for(workbook_with, [
+        ("Base work", "100", None),
+        ("Project Total ex GST", "100", None),
+        ("Option: Extra work", "15", None),
+        ("Deletion: Door adjustment", "-15", None),
+        ("Removal: Discontinued work (excluded from source total)", "-20", None),
+    ])
+    pending = reconcile(evidence, SOURCE, {})
+    assert pending["status"] == "blocked" and pending["working_scope_total"] is None
+    assert [question["key"] for question in pending["questions"]] == [
+        "source_inclusion:Trade Summary!D6", "source_inclusion:Trade Summary!D7",
+    ]
+    assert [row["reason"] for row in pending["outside_source_scope"]] == ["explicit_source_total_exclusion"]
+    answers = {question["key"]: "excluded" for question in pending["questions"]}
+    excluded = reconcile(evidence, SOURCE, answers)
+    assert excluded["status"] == "ready_for_classification"
+    assert excluded["working_scope_total"] == "100.00"
+    assert [item["reason"] for item in excluded["outside_source_scope"]] == [
+        "operator_confirmed_source_exclusion", "operator_confirmed_source_exclusion",
+        "explicit_source_total_exclusion",
+    ]
+    included = reconcile(evidence, BASE, {key: "included" for key in answers})
+    assert included["status"] == "ready_for_classification"
+    assert [item["effect"] for item in included["scope_exclusions"]] == ["-15", "15"]
+
+
+def test_ambiguous_gst_label_on_addition_is_not_treated_as_ex_gst(workbook_with):
+    evidence = evidence_for(workbook_with, [
+        ("Base work", "100", None),
+        ("Project Total ex GST", "100", "D4"),
+        ("Option: Additional work ex GST / incl GST", "11", None),
+    ])
+    report = reconcile(evidence, {**SOURCE, "include": ["Trade Summary!D6"]}, {})
+    assert report["status"] == "blocked" and report["scope_additions"] == []
+    question, = report["questions"]
+    assert question["kind"] == "scope_addition_gst_basis"
