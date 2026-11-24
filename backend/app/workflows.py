@@ -141,7 +141,7 @@ def verify_pending(snapshot, inputs: InvoiceState) -> None:
 def verify_ready(snapshot, inputs: InvoiceState, expected_basis: str | None) -> None:
     verify_checkpoint(snapshot, inputs)
     if (
-        snapshot.next or snapshot.interrupts
+        snapshot.next or snapshot.tasks or snapshot.interrupts
         or snapshot.values.get("stage") != "ready_for_extraction"
         or snapshot.values.get("effective_gst_basis") != expected_basis
     ):
@@ -153,12 +153,12 @@ async def initialize_workflow(connection: AsyncConnection, revision) -> Workflow
     inputs = checkpoint_inputs(revision)
     async with durable_graph() as graph:
         snapshot = await graph.aget_state(config)
-        if not snapshot.values and not snapshot.next:
-            await graph.ainvoke(inputs, config=config)
-            snapshot = await graph.aget_state(config)
-        elif snapshot.next and not snapshot.interrupts:
-            # A restart may have left a checkpoint before the first pause or final stage.
+        if not snapshot.interrupts and (snapshot.next or snapshot.tasks):
+            # A saved node write may already be projected into the snapshot with no next node.
             await graph.ainvoke(None, config=config)
+            snapshot = await graph.aget_state(config)
+        elif not snapshot.values and not snapshot.interrupts:
+            await graph.ainvoke(inputs, config=config)
             snapshot = await graph.aget_state(config)
 
         if snapshot.interrupts:
@@ -183,13 +183,13 @@ async def resume_accepted(connection: AsyncConnection, revision, answer: GSTAnsw
     expected_basis = GST_BASES[answer]
     async with durable_graph() as graph:
         snapshot = await graph.aget_state(config)
+        if not snapshot.interrupts and (snapshot.next or snapshot.tasks):
+            verify_checkpoint(snapshot, inputs)
+            await graph.ainvoke(None, config=config)
+            snapshot = await graph.aget_state(config)
         if snapshot.interrupts:
             verify_pending(snapshot, inputs)
             await graph.ainvoke(Command(resume=answer), config=config)
-            snapshot = await graph.aget_state(config)
-        elif snapshot.next and snapshot.values.get("effective_gst_basis") == expected_basis:
-            verify_checkpoint(snapshot, inputs)
-            await graph.ainvoke(None, config=config)
             snapshot = await graph.aget_state(config)
         # If graph progress committed before the task status did, only reconcile the status.
         verify_ready(snapshot, inputs, expected_basis)

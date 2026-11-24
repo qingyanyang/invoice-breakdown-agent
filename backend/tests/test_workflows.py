@@ -1,16 +1,23 @@
 import asyncio
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg import OperationalError
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app import main, workflows
 from app.checkpoints import open_checkpointer, setup_checkpoints
 from app.config import settings
+from app.database import ALEMBIC_INI
+from app.invoice_graph import compile_invoice_graph
 
 ALICE = {"Authorization": "Bearer " + "a" * 40}
 BOB = {"Authorization": "Bearer " + "b" * 40}
@@ -79,6 +86,9 @@ async def test_checkpoints_require_explicit_setup(task_runtime, disposable_postg
         current = assert_success(await client.get(f"/tasks/{task_id}/workflow", headers=ALICE))
         assert current["status"] == "not_started"
     assert not inspect(admin).has_table("checkpoints", schema=schema)
+    config = Config(str(ALEMBIC_INI))
+    command.downgrade(config, "0002_task_sources")
+    command.upgrade(config, "head")
     await setup_checkpoints(settings)
     await setup_checkpoints(settings)
     assert inspect(admin).has_table("checkpoints", schema=schema)
@@ -202,3 +212,106 @@ async def test_recovery_uses_accepted_answer_after_restart(
         assert (await answer(client, task_id, question["id"], "inc_gst")).status_code == 409
     assert resumed == 1
     assert (await checkpoint_id(task_id) == before) == checkpoint_already_advanced
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("phase", ["start", "answer"])
+async def test_resume_after_checkpoint_snapshot_write_fails(
+    task_runtime, workbook_with, monkeypatch, phase,
+):
+    await setup_checkpoints(settings)
+    original_put = AsyncPostgresSaver.aput
+    original_put_writes = AsyncPostgresSaver.aput_writes
+    persisted_writes = defaultdict(asyncio.Event)
+
+    async def track_writes(saver, config, writes, task_id, task_path=""):
+        await original_put_writes(saver, config, writes, task_id, task_path)
+        persisted_writes[config["configurable"]["checkpoint_id"]].set()
+
+    async def fail_snapshot(saver, config, checkpoint, metadata, new_versions):
+        if phase == "start":
+            fail = metadata["source"] == "loop" and metadata["step"] == 0
+        else:
+            fail = checkpoint["channel_values"].get("stage") == "ready_for_extraction"
+        if fail:
+            parent_id = config["configurable"]["checkpoint_id"]
+            await asyncio.wait_for(persisted_writes[parent_id].wait(), timeout=5)
+            raise OperationalError("simulated failure after saving node writes")
+        return await original_put(saver, config, checkpoint, metadata, new_versions)
+
+    async with running_service() as client:
+        if phase == "start":
+            task_id = await create_task(client)
+            await upload(client, task_id, workbook_with({}))
+        else:
+            task_id, question = await pause_for_gst(client, workbook_with({}))
+        with monkeypatch.context() as patch:
+            patch.setattr(AsyncPostgresSaver, "aput_writes", track_writes)
+            patch.setattr(AsyncPostgresSaver, "aput", fail_snapshot)
+            if phase == "start":
+                response = await start(client, task_id)
+            else:
+                response = await answer(client, task_id, question["id"], "inc_gst")
+            assert response.status_code == 503, response.text
+
+    config = {"configurable": {"thread_id": f"invoice:{task_id}:2"}}
+    async with open_checkpointer(settings) as saver:
+        saved = await saver.aget_tuple(config)
+        snapshot = await compile_invoice_graph(saver).aget_state(config)
+        assert saved.pending_writes
+        assert not snapshot.next and snapshot.tasks
+
+    async with running_service() as client:
+        before = assert_success(await client.get(f"/tasks/{task_id}/workflow", headers=ALICE))
+        recovered = assert_success(await start(client, task_id))
+        assert recovered["revision"] == 2
+        if phase == "start":
+            assert before["status"] == "not_started"
+            assert recovered["status"] == "awaiting_clarification"
+            assert recovered["question"]["answer"] is None
+        else:
+            assert before["status"] == "answer_accepted"
+            assert recovered["status"] == "ready_for_extraction"
+            assert recovered["effective_gst_basis"] == "including_gst"
+            assert recovered["question"]["id"] == question["id"]
+
+
+@pytest.mark.anyio
+async def test_downgrade_then_upgrade_restarts_retained_task(
+    task_runtime, workbook_with,
+):
+    await setup_checkpoints(settings)
+    workbook = workbook_with({})
+    async with running_service() as client:
+        task_id, old_question = await pause_for_gst(client, workbook)
+        ready = assert_success(await answer(client, task_id, old_question["id"]))
+        assert ready["status"] == "ready_for_extraction"
+
+    unrelated_config = {"configurable": {"thread_id": "unrelated-workflow"}}
+    async with open_checkpointer(settings) as saver:
+        graph = compile_invoice_graph(saver)
+        await graph.ainvoke(
+            {"source_sha256": "fixture", "target_amount": None, "submitted_gst_basis": None},
+            config=unrelated_config,
+        )
+
+    config = Config(str(ALEMBIC_INI))
+    command.downgrade(config, "0002_task_sources")
+    command.upgrade(config, "head")
+    await setup_checkpoints(settings)
+
+    async with open_checkpointer(settings) as saver:
+        assert await saver.aget_tuple(unrelated_config)
+        assert await saver.aget_tuple({"configurable": {"thread_id": f"invoice:{task_id}:2"}}) is None
+
+    async with running_service() as client:
+        source = await client.get(f"/tasks/{task_id}/source", headers=ALICE)
+        assert source.status_code == 200 and source.content == workbook
+        before = assert_success(await client.get(f"/tasks/{task_id}/workflow", headers=ALICE))
+        assert before["revision"] == 2 and before["status"] == "not_started"
+        pending = assert_success(await start(client, task_id))
+        assert pending["status"] == "awaiting_clarification"
+        assert pending["question"]["id"] != old_question["id"]
+        assert (await answer(client, task_id, old_question["id"])).status_code == 404
+        ready = assert_success(await answer(client, task_id, pending["question"]["id"], "inc_gst"))
+        assert ready["status"] == "ready_for_extraction" and ready["effective_gst_basis"] == "including_gst"

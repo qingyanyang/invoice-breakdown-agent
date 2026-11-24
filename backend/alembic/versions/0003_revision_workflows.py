@@ -49,5 +49,23 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     schema = op.get_context().opts["version_table_schema"]
+    quoted_schema = op.get_context().dialect.identifier_preparer.quote_identifier(schema)
+    # These tables are optional because the checkpoint setup is separate from Alembic.
+    # Remove only this workflow's threads, including starts without an application row.
+    for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+        op.execute(
+            f"""
+            DO $cleanup$
+            BEGIN
+                IF to_regclass('{quoted_schema}.{table}') IS NOT NULL THEN
+                    DELETE FROM {quoted_schema}.{table} AS checkpoint
+                    USING {quoted_schema}.task_revisions AS revision
+                    WHERE checkpoint.thread_id =
+                        concat('invoice:', revision.task_id, ':', revision.revision);
+                END IF;
+            END
+            $cleanup$;
+            """
+        )
     op.drop_table("workflow_answers", schema=schema)
     op.drop_table("revision_workflows", schema=schema)

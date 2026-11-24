@@ -170,6 +170,12 @@ checkpoint store returns HTTP 503 from workflow actions. Run the explicit
 checkpoint setup before enabling these actions. Workbook extraction is
 tracked in issue #6.
 
+Stop workflow traffic before downgrading to Alembic revision `0002_task_sources`.
+The downgrade keeps tasks, input revisions, and source files, and removes this
+workflow's questions, answers, and matching checkpoint threads. Checkpoint
+tables and unrelated threads remain available. After re-upgrade and checkpoint
+setup, start a retained task again to re-confirm any unknown GST basis.
+
 ## Tests
 
 From `backend/` with the virtual environment active:
