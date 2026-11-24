@@ -9,7 +9,10 @@ class Settings(BaseSettings):
     database_url: str | None = None
     postgres_schema: str = "invoice_breakdown"
     cors_allowed_origins: str = "http://localhost:5173"
-    llm_api_key: str | None = None
+    llm_api_key: SecretStr | None = None
+    classification_model: str | None = None
+    classification_skill_path: Path | None = None
+    classification_codex_path: Path | None = None
     operator_tokens: SecretStr | None = None
     source_storage_directory: Path | None = None
     azure_client_id: str | None = None

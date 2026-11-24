@@ -11,6 +11,7 @@ source_reconciliations = Table(
     Column("task_id", Uuid, primary_key=True),
     Column("revision", Integer, primary_key=True),
     Column("extractor_version", String(40), primary_key=True),
+    Column("generation", Uuid, server_default=func.gen_random_uuid(), nullable=False),
     Column("source_sha256", String(64), nullable=False),
     Column("status", String(32), nullable=False),
     Column("scope", JSONB, nullable=False),

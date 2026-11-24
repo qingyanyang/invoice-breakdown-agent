@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.classifications import router as classification_router
 from app.config import settings
 from app.database import (
     DatabaseConfigurationError,
@@ -65,6 +66,7 @@ app.include_router(task_router)
 app.include_router(workflow_router)
 app.include_router(extraction_router)
 app.include_router(reconciliation_router)
+app.include_router(classification_router)
 
 origins = [
     origin.strip()
