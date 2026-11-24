@@ -7,3 +7,5 @@ alembic>=1.16,<2
 azure-identity
 azure-storage-blob
 defusedxml
+langgraph>=1,<2
+langgraph-checkpoint-postgres>=3,<4

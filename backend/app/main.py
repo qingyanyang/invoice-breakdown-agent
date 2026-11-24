@@ -16,6 +16,7 @@ from app.database import (
 from app.operators import operator_credentials
 from app.source_storage import create_source_storage
 from app.tasks import router as task_router
+from app.workflows import router as workflow_router
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(task_router)
+app.include_router(workflow_router)
 
 origins = [
     origin.strip()
