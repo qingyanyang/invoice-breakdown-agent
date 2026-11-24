@@ -189,7 +189,8 @@ The result is tied to the immutable source SHA-256 and extractor version.
 `result.raw` preserves sheet order and visibility, cell coordinates and types,
 raw values and text, number format IDs and available codes, hidden rows and
 columns, merged ranges, and cell notes and comments. Shared-formula references
-retain the anchor when the source provides one. A raw formula cache is either
+retain the anchor when the source provides one. Stored array results also
+retain their formula anchor and declared range. A raw formula cache is either
 `missing` or `saved_unverified`. Extraction does not calculate formulas or
 label saved results verified.
 
@@ -201,7 +202,8 @@ source remains available through the task's source download endpoint.
 Extraction enforces a 10 MiB uploaded and 64 MiB expanded workbook limit,
 100 sheets, 50,000 stored cells, and a 16 MiB result. Structural record and
 individual metadata part limits bound parsing. Source retrieval and parsing
-have a 20-second deadline. A timed-out parser is canceled. A failed extraction
+have a 20-second deadline. A timed-out parser is canceled. A storage read
+that outlasts its request keeps its worker slot until it finishes. A failed extraction
 records its error with no partial result, and a changed source or revision
 returns HTTP 409 before publication.
 

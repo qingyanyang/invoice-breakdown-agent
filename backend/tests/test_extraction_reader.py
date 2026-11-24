@@ -130,3 +130,18 @@ def test_limits_produce_explicit_failures(monkeypatch, setting, limit, code):
     with pytest.raises(reader.ExtractionProblem) as error:
         reader.extract_workbook((FIXTURES / "reconciliation.xlsx").read_bytes())
     assert error.value.code == code
+
+
+def test_sparse_array_marks_only_stored_result_cells(workbook_with):
+    sheet = f"""
+<worksheet xmlns="{SHEET_NS}"><sheetData>
+<row r="2"><c r="D2"><f t="array" ref="D2:D1048576">ROW(D2:D1048576)</f><v>2</v></c></row>
+<row r="1048576"><c r="D1048576"/><c r="E1048576"><v>42</v></c></row>
+</sheetData></worksheet>
+""".encode()
+    evidence = reader.extract_workbook(workbook_with({"xl/worksheets/sheet1.xml": sheet}))
+    raw = cells(evidence["raw"]["sheets"][0])
+    assert set(raw) == {"D2", "D1048576", "E1048576"}
+    assert raw["D1048576"]["formula"]["anchor"] == "D2"
+    assert raw["D1048576"]["formula"]["cache_status"] == "missing"
+    assert raw["E1048576"]["formula"] is None

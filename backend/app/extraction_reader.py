@@ -2,8 +2,11 @@
 
 import json
 import re
+from bisect import bisect_left, bisect_right
+from heapq import heappop, heappush
 from io import BytesIO
 from pathlib import PurePosixPath
+from typing import NamedTuple
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile, ZipFile
 
@@ -17,7 +20,7 @@ from app.workbook_upload import (
     SHEET_TYPES, internal_target, relationships, validate_workbook,
 )
 
-EXTRACTOR_VERSION = "xlsx-evidence-v1"
+EXTRACTOR_VERSION = "xlsx-evidence-v2"
 MAX_SHEETS = 100
 MAX_CELLS = 50_000
 MAX_CONTEXT_RECORDS = 100_000
@@ -188,6 +191,75 @@ def cell_evidence(element, ns, coordinate, column, strings, formats) -> dict:
     }
 
 
+class ArrayRange(NamedTuple):
+    first_row: int
+    last_row: int
+    first_column: int
+    last_column: int
+    anchor: str
+    reference: str
+
+
+def array_range(coordinate: str, attributes: dict) -> ArrayRange:
+    reference = attributes.get("ref", "")
+    first, separator, last = reference.partition(":")
+    first_row, first_column = coordinate_parts(first)
+    last_row, last_column = coordinate_parts(last if separator else first)
+    if first != coordinate or last_row < first_row or last_column < first_column:
+        raise BadZipFile
+    return ArrayRange(first_row, last_row, first_column, last_column, coordinate, reference)
+
+
+def mark_array_results(rows: list[dict], arrays: list[ArrayRange]) -> None:
+    if not arrays:
+        return
+
+    # Track active ranges by starting column and expire them by ending row.
+    # Visit only stored cells, even when a declared range covers a large sparse area.
+    starts = iter(arrays)
+    pending = next(starts, None)
+    active: list[ArrayRange] = []
+    endings: list[tuple[int, int]] = []
+
+    def column_key(array: ArrayRange) -> int:
+        return array.first_column
+
+    for row in rows:
+        number = row["row"]
+        while endings and endings[0][0] < number:
+            _, column = heappop(endings)
+            active.pop(bisect_left(active, column, key=column_key))
+        while pending is not None and pending.first_row == number:
+            index = bisect_left(active, pending.first_column, key=column_key)
+            if (
+                index > 0 and active[index - 1].last_column >= pending.first_column
+                or index < len(active) and active[index].first_column <= pending.last_column
+            ):
+                raise BadZipFile
+            active.insert(index, pending)
+            heappush(endings, (pending.last_row, pending.first_column))
+            pending = next(starts, None)
+        if not active:
+            continue
+        for cell in row["cells"]:
+            column = cell["column"]
+            index = bisect_right(active, column, key=column_key) - 1
+            if index < 0 or active[index].last_column < column:
+                continue
+            array = active[index]
+            if cell["coordinate"] == array.anchor:
+                cell["formula"]["anchor"] = array.anchor
+                continue
+            if cell["formula"] is not None:
+                raise BadZipFile
+            cell["formula"] = {
+                "text": None,
+                "attributes": {"t": "array", "ref": array.reference},
+                "anchor": array.anchor,
+                "cache_status": "saved_unverified" if cell["raw_value"] not in (None, "") else "missing",
+            }
+
+
 def worksheet_cells(archive: ZipFile, part: str, ns: str, strings, formats, budget: Budget) -> dict:
     rows, columns, merges = [], [], []
     stack = []
@@ -196,6 +268,7 @@ def worksheet_cells(archive: ZipFile, part: str, ns: str, strings, formats, budg
     row = None
     shared_anchors = {}
     shared_followers = []
+    arrays = []
 
     with archive.open(part) as stream:
         for event, element in iterparse(stream, events=("start", "end"), forbid_dtd=True):
@@ -206,9 +279,10 @@ def worksheet_cells(archive: ZipFile, part: str, ns: str, strings, formats, budg
                 parent_tag = stack[-2].tag if len(stack) > 1 else None
                 if element.tag == f"{ns}row" and parent_tag == f"{ns}sheetData":
                     budget.record()
-                    row_number = int(element.get("r", row_number + 1))
-                    if not 1 <= row_number <= 1_048_576:
+                    next_row = int(element.get("r", row_number + 1))
+                    if not row_number < next_row <= 1_048_576:
                         raise BadZipFile
+                    row_number = next_row
                     column_number = 0
                     row = {"row": row_number, "hidden": element.get("hidden") in {"1", "true"}, "cells": []}
                 if element.tag == f"{ns}c" and parent_tag == f"{ns}row" and row is not None:
@@ -231,6 +305,8 @@ def worksheet_cells(archive: ZipFile, part: str, ns: str, strings, formats, budg
                             shared_anchors[identifier] = coordinate
                         else:
                             shared_followers.append((identifier, formula))
+                if formula and formula["attributes"].get("t") == "array":
+                    arrays.append(array_range(coordinate, formula["attributes"]))
                 active_cell = None
             elif active_cell is None:
                 if element.tag == f"{ns}row" and row is not None:
@@ -252,6 +328,7 @@ def worksheet_cells(archive: ZipFile, part: str, ns: str, strings, formats, budg
 
     for identifier, formula in shared_followers:
         formula["anchor"] = shared_anchors.get(identifier)
+    mark_array_results(rows, arrays)
     return {"rows": rows, "columns": columns, "merged_ranges": merges}
 
 
@@ -314,6 +391,8 @@ def extract_workbook(data: bytes) -> dict:
             entries = workbook.findall(f"{ns}sheets/{ns}sheet")
             if len(entries) > MAX_SHEETS:
                 raise ExtractionProblem("sheet_limit", "Workbook exceeds the extraction sheet limit")
+            if len({sheet.attrib["name"].casefold() for sheet in entries}) != len(entries):
+                raise BadZipFile
             rels = relationships(archive, "xl/_rels/workbook.xml.rels")
             by_id = {rel.attrib["Id"]: rel for rel in rels}
             budget = Budget()

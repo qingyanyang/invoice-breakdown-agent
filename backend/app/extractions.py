@@ -1,3 +1,5 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 from uuid import UUID
 
@@ -12,7 +14,7 @@ from app.extraction_reader import EXTRACTOR_VERSION, ExtractionProblem, extract_
 from app.extraction_tables import source_extractions
 from app.operators import Operator
 from app.source_storage import SourceIntegrityError, SourceStorage, StorageError, read_verified_source
-from app.tasks import database_for, lock_current_revision, owned_revision, storage_for, transaction
+from app.tasks import database_for, lock_current_revision, owned_revision, transaction
 from app.workflows import RevisionRequest, workflow_record
 
 router = APIRouter(prefix="/tasks/{task_id}/extraction", tags=["extraction"])
@@ -24,6 +26,34 @@ FAILURE_HTTP_STATUS = {
     "source_unavailable": 503,
     "worker_unavailable": 503,
 }
+
+
+class SourceReadWorker:
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extraction-source")
+        self.slot = asyncio.Semaphore(1)
+
+    async def read(self, storage: SourceStorage, key: str, size: int, checksum: str) -> bytes:
+        await self.slot.acquire()
+        try:
+            job = asyncio.get_running_loop().run_in_executor(
+                self.executor, read_verified_source, storage, key, size, checksum,
+            )
+        except BaseException:
+            self.slot.release()
+            raise
+
+        def finished(future):
+            self.slot.release()
+            if not future.cancelled():
+                future.exception()
+
+        job.add_done_callback(finished)
+        # The request may time out, but the slot follows the underlying read.
+        return await asyncio.shield(job)
+
+    async def close(self) -> None:
+        await to_thread.run_sync(self.executor.shutdown)
 
 
 class ExtractionDetails(BaseModel):
@@ -59,13 +89,14 @@ async def require_extraction_ready(connection: AsyncConnection, revision) -> Non
         raise HTTPException(409, "Workflow must reach ready_for_extraction")
 
 
-async def extract_source(storage: SourceStorage, revision, limiter) -> dict:
+async def extract_source(storage: SourceStorage | None, revision, limiter, reader: SourceReadWorker) -> dict:
+    if storage is None:
+        raise ExtractionProblem("source_unavailable", "Source storage unavailable")
     try:
         with fail_after(EXTRACTION_TIMEOUT_SECONDS):
             async with limiter:
-                data = await to_thread.run_sync(
-                    read_verified_source, storage, revision["source_key"],
-                    revision["source_size"], revision["source_sha256"], abandon_on_cancel=True,
+                data = await reader.read(
+                    storage, revision["source_key"], revision["source_size"], revision["source_sha256"],
                 )
                 return await to_process.run_sync(extract_workbook, data, cancellable=True)
     except SourceIntegrityError:
@@ -117,7 +148,10 @@ async def run_extraction(
             return existing
 
     try:
-        result = await extract_source(storage_for(request), original, request.app.state.extraction_limiter)
+        result = await extract_source(
+            request.app.state.source_storage, original,
+            request.app.state.extraction_limiter, request.app.state.extraction_source_reader,
+        )
     except ExtractionProblem as error:
         fields = {"status": "failed", "result": None, "error_code": error.code, "error_detail": error.detail}
     else:
