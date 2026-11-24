@@ -40,6 +40,17 @@ def value(cell):
     return Decimal(cell.findtext("x:v", namespaces=NS))
 
 
+def verify_labeled_amount(workbook, source, row, expected_label, expected_amount):
+    label = text(workbook, source[f"A{row}"])
+    amount = value(source[f"D{row}"])
+    if (label, amount) != (expected_label, expected_amount):
+        raise AssertionError(
+            f"Trade Summary!A{row}/D{row}: expected {expected_label!r} "
+            f"with amount {expected_amount}, found {label!r} with amount {amount}"
+        )
+    return amount
+
+
 def cents(amount):
     return amount.quantize(CENT, rounding=ROUND_HALF_UP)
 
@@ -49,12 +60,10 @@ def verify_reconciliation():
         assert sheet_names(workbook) == ["Trade Summary", "Notes"]
         source = cells(workbook, 1)
         notes = cells(workbook, 2)
-        assert "outside the source total" in text(workbook, notes["A3"])
+        assert text(workbook, notes["A3"]) == (
+            "Feature Access Panel is outside the source total."
+        ), "Notes!A3"
         assert text(workbook, source["B2"]) == "Excluding GST"
-        assert text(workbook, source["A10"]) == "Level 1 patching", "Trade Summary!A10"
-        assert text(workbook, source["A11"]) == "Level 1 Standard Access Panel", (
-            "Trade Summary!A11"
-        )
         for coordinate, formula in {
             "D4": "B4*(1+C4)",
             "D5": "B5*(1+C5)",
@@ -69,10 +78,11 @@ def verify_reconciliation():
             for row in (4, 5)
         )
         doors = value(source["D7"]) + value(source["D8"])
-        make_good = value(source["D10"])
-        access_panel = value(source["D11"])
+        make_good = verify_labeled_amount(workbook, source, 10, "Level 1 patching", 25)
+        access_panel = verify_labeled_amount(
+            workbook, source, 11, "Level 1 Standard Access Panel", 20
+        )
         assert (partition, glazing, doors) == (110, 55, 50)
-        assert (make_good, access_panel) == (25, 20)
         assert cents(value(source["D4"])) == partition
         assert cents(value(source["D5"])) == glazing
         assert cents(value(source["D6"])) == partition + glazing
@@ -124,15 +134,14 @@ def verify_scope_ambiguity():
         assert sheet_names(workbook) == ["Trade Summary"]
         source = cells(workbook, 1)
         assert "Combined Level 1 and Level 2" in text(workbook, source["A4"])
-        assert text(workbook, source["A5"]) == "Option: Ceiling tile change", (
-            "Trade Summary!A5"
+        option = verify_labeled_amount(workbook, source, 5, "Option: Ceiling tile change", 15)
+        deletion = verify_labeled_amount(
+            workbook, source, 6, "Deletion: Ceiling tile credit", -15
         )
-        assert text(workbook, source["A6"]) == "Deletion: Ceiling tile credit", (
-            "Trade Summary!A6"
-        )
-        base, option, deletion, total = (value(source[f"D{row}"]) for row in range(4, 8))
-        assert (base, option, deletion, total) == (75, 15, -15, 75)
-        assert base == total == base + option + deletion
+        base = value(source["D4"])
+        total = value(source["D7"])
+        assert base == total == 75
+        assert total == base + option + deletion
 
 
 if __name__ == "__main__":
