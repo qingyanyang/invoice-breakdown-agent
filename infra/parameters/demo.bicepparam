@@ -25,6 +25,8 @@ param databaseUrl = readEnvironmentVariable('DATABASE_URL', '')
 param llmApiKey = readEnvironmentVariable('LLM_API_KEY', '')
 // Non-secure gate: empty(@secure()) is unreliable in ARM, so scripts/CI set this explicitly.
 param enableLlmApiKey = false
+param operatorTokens = readEnvironmentVariable('OPERATOR_TOKENS', '')
+param enableOperatorTokens = !empty(readEnvironmentVariable('OPERATOR_TOKENS', ''))
 param postgresSchema = 'invoice_breakdown'
 
 // Phase 1: false — no Container App until a public GHCR image exists.

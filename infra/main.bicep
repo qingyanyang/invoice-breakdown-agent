@@ -26,6 +26,13 @@ param llmApiKey string = ''
 @description('When true, wire ACA secret llm-api-key. Set from deploy scripts when LLM_API_KEY is present — do not derive via empty(secure).')
 param enableLlmApiKey bool = false
 
+@secure()
+@description('Optional per-operator bearer token map for the temporary task API.')
+param operatorTokens string = ''
+
+@description('Enable the operator token secret when supplied by the deployment environment.')
+param enableOperatorTokens bool = false
+
 @description('PostgreSQL schema used by FastAPI / Alembic (Supabase).')
 param postgresSchema string = 'invoice_breakdown'
 
@@ -154,6 +161,8 @@ module containerApp 'modules/container-app.bicep' = if (deployContainerApp) {
     postgresSchema: postgresSchema
     llmApiKey: llmApiKey
     enableLlmApiKey: enableLlmApiKey
+    operatorTokens: operatorTokens
+    enableOperatorTokens: enableOperatorTokens
     containerCpu: containerCpu
     containerMemory: containerMemory
     minReplicas: minReplicas

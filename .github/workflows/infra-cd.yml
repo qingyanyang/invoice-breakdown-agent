@@ -79,6 +79,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OPERATOR_TOKENS: ${{ secrets.OPERATOR_TOKENS }}
         run: |
           set -euo pipefail
 
@@ -99,6 +100,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OPERATOR_TOKENS: ${{ secrets.OPERATOR_TOKENS }}
         run: |
           set -euo pipefail
 

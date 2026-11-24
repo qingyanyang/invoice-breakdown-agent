@@ -1,0 +1,58 @@
+import os
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+from sqlalchemy.schema import DropSchema
+
+from app.config import settings
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture
+def inherited_service_profile(monkeypatch, tmp_path):
+    service_file = tmp_path / "pg_service.conf"
+    service_file.write_text("[redirect]\nhostaddr=127.0.0.2\nsslmode=require\n")
+    monkeypatch.setenv("PGSERVICEFILE", str(service_file))
+    monkeypatch.setenv("PGSERVICE", "redirect")
+
+
+@pytest.fixture
+def disposable_postgres(monkeypatch, inherited_service_profile):
+    raw_url = os.environ.get("TEST_DATABASE_URL")
+    if not raw_url:
+        pytest.skip("TEST_DATABASE_URL is required for disposable PostgreSQL tests")
+
+    # Refuse remote databases and connection options that can redirect the connection.
+    try:
+        url = make_url(raw_url)
+    except (ArgumentError, ValueError):
+        pytest.fail("Invalid TEST_DATABASE_URL", pytrace=False)
+    if (
+        url.drivername != "postgresql+psycopg"
+        or url.host != "127.0.0.1"
+        or url.database != "invoice_breakdown_test"
+        or url.query
+    ):
+        pytest.fail("Use a disposable invoice_breakdown_test database on 127.0.0.1", pytrace=False)
+    monkeypatch.delenv("PGHOSTADDR", raising=False)
+    monkeypatch.delenv("PGSERVICE", raising=False)
+
+    schema = f"test_invoice_{uuid4().hex}"
+    monkeypatch.setattr(settings, "database_url", raw_url)
+    monkeypatch.setattr(settings, "postgres_schema", schema)
+    admin = create_engine(url, connect_args={"connect_timeout": 3})
+    try:
+        yield admin, schema
+    finally:
+        try:
+            with admin.begin() as connection:
+                connection.execute(DropSchema(schema, cascade=True, if_exists=True))
+        finally:
+            admin.dispose()

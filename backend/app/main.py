@@ -13,6 +13,9 @@ from app.database import (
     database_heads,
     repository_heads,
 )
+from app.operators import operator_credentials
+from app.source_storage import create_source_storage
+from app.tasks import router as task_router
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +29,21 @@ async def lifespan(app: FastAPI):
         logger.warning("Database readiness unavailable: %s", error)
 
     app.state.database_engine = engine
+    app.state.source_storage = None
+    try:
+        app.state.operator_credentials = operator_credentials(settings.operator_tokens)
+    except ValueError as error:
+        logger.warning("Operator authentication unavailable: %s", error)
+        app.state.operator_credentials = {}
+    try:
+        app.state.source_storage = create_source_storage(settings)
+    except ValueError:
+        logger.warning("Source storage configuration is invalid")
     try:
         yield
     finally:
+        if app.state.source_storage is not None:
+            app.state.source_storage.close()
         if engine is not None:
             await engine.dispose()
 
@@ -38,6 +53,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(task_router)
 
 origins = [
     origin.strip()
