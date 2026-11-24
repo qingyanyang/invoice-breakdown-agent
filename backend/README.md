@@ -209,6 +209,55 @@ returns HTTP 409 before publication.
 
 Reconciliation and classification consume this evidence in later issues.
 
+## Reconcile source totals and scope
+
+Use the operator's bearer token after publishing an extraction for the current
+revision.
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /tasks/{id}/reconciliation` | Send `expected_revision` and an optional `scope` object. Reconcile the current extraction. |
+| `GET /tasks/{id}/reconciliation` | Read the report, pending questions, and confirmed decisions for the current extraction. |
+| `POST /tasks/{id}/reconciliation/answers` | Send `expected_revision`, a pending `question_id`, and one of its offered answers. |
+
+A scope object accepts `mode` equal to `source` or `base_only`. In source mode,
+`include` accepts verified outside-scope detail references and `exclude`
+accepts traced source references, such as `Trade Summary!D10`. Base-only mode
+removes Option, Removal, and Deletion contributions. Their labels identify
+scope candidates. The workbook dependency trace or an explicit source-scope
+answer establishes whether the reported Total includes them. The signed
+amount and its effect on the bridge are stored separately.
+
+The control total uses explicit project-total labels and separates known
+sheet subtotals, alternatives, and GST-inclusive totals. Equally plausible
+controls require a choice. The supported hierarchy uses declared additive
+references, vertical SUM ranges, or a clearly labelled flat table. Markup
+can be checked against explicit base or quantity/rate inputs where the
+source structure supports it. Unsupported calculations, overlapping
+dependencies, or untraced rows remain blocked. Confirmed meanings are
+recorded separately from independent arithmetic. Formula caches retain
+their extraction verification status, and answers supply no substitute
+amounts for missing calculation evidence.
+
+The report includes the reported Total, the independent total, the exact
+difference, and a cent-level difference of independent minus reported.
+Arithmetic uses Decimal at up to 256-digit precision. Round the two totals
+to cents using ROUND_HALF_UP for the gate. Round the working scope only
+after applying the signed additions and exclusions. The report reaches
+`ready_for_classification` only when the cent difference is zero, the source
+basis and contribution evidence are established, and no unresolved
+questions or issues remain.
+
+For the synthetic reconciliation fixture, D12 references D6, D9, D10 and D11.
+D6 contributes D4 (B4 × 1.10 = 110.00) and D5 (B5 × 1.10 = 55.00).
+D9 contributes D7 and D8 (60.00 − 10.00). D10 adds 25.00 and D11 adds
+20.00. The six detail amounts sum to 260.00. With no authorized scope
+changes, the working scope is 260.00.
+
+Source rules follow the approved specification mapped in the fixture guide,
+particularly sections II, III, VI and X. Classification and target allocation
+belong to later issues.
+
 ## Tests
 
 From `backend/` with the virtual environment active:
