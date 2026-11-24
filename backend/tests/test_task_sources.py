@@ -5,47 +5,17 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 
 from app import main, source_cleanup
 from app import tasks as task_api
-from app.config import settings
-from app.database import ALEMBIC_INI, metadata
 from app.source_storage import LocalSourceStorage, StorageError
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "invoice_breakdown"
 ALICE = {"Authorization": "Bearer " + "a" * 40}
 BOB = {"Authorization": "Bearer " + "b" * 40}
-
-
-@pytest.fixture
-def task_runtime(disposable_postgres, monkeypatch, tmp_path):
-    _, schema = disposable_postgres
-    directory = tmp_path / "owned-sources"
-    monkeypatch.setattr(settings, "source_storage_directory", directory)
-    monkeypatch.setattr(settings, "azure_storage_blob_endpoint", None)
-    monkeypatch.setattr(
-        settings, "operator_tokens",
-        SecretStr('{"alice":"' + "a" * 40 + '","bob":"' + "b" * 40 + '"}'),
-    )
-    original_engine = main.create_application_engine
-
-    def engine_for_test(config):
-        engine = original_engine(config)
-        engine.update_execution_options(schema_translate_map={metadata.schema: schema})
-        return engine
-
-    monkeypatch.setattr(main, "create_application_engine", engine_for_test)
-    monkeypatch.setattr(source_cleanup, "create_application_engine", engine_for_test)
-    alembic = Config(str(ALEMBIC_INI))
-    command.upgrade(alembic, "0001_database_baseline")
-    command.upgrade(alembic, "head")
-    return directory
 
 
 @asynccontextmanager

@@ -79,7 +79,7 @@ including the pool pre-ping. A stalled connection is discarded. FastAPI
 disposes of the connection pool on shutdown. Run
 migrations explicitly before starting database-backed operations.
 
-LangGraph checkpoint setup and workflow resume are tracked in issue #5.
+Run `python -m app.checkpoints` after Alembic to install or upgrade the LangGraph checkpoint tables. Both commands use the configured PostgreSQL schema. Application startup leaves these migrations to the operator.
 
 ## Task API and source storage
 
@@ -138,6 +138,37 @@ The command preserves objects referenced by any revision, including old
 revisions. If a filesystem staging file could not be removed, pass the exact
 `.staging` key from the logs to the same command. Use the original filesystem
 storage and database for that cleanup.
+
+## Start a workflow and answer a clarification
+
+Upload a source first. Then use the operator's bearer token on these routes:
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /tasks/{id}/workflow` | Send `{"expected_revision":2}` to start or recover that revision. |
+| `GET /tasks/{id}/workflow` | Read the current revision's durable status and question, if present. |
+| `POST /tasks/{id}/workflow/answers` | Send the current `expected_revision`, the pending `question_id`, and `answer` equal to `ex_gst` or `inc_gst`. |
+
+If the submitted target has an unknown GST basis, the workflow pauses with
+`awaiting_clarification`. The evidence contains the submitted amount and its
+unknown basis. Confirming the basis applies to this same revision. The task
+input retains its original basis and the workflow shows the confirmed
+`effective_gst_basis`. Use the answer endpoint for this confirmation. Changing
+the target amount or replacing a source creates a new revision with a new
+checkpoint thread. Old questions and answers remain bound to their original
+revision.
+
+An invalid answer returns HTTP 422. Duplicate or stale submissions return
+HTTP 409 and cannot advance another revision. An accepted answer stays
+recorded even if checkpoint resume is interrupted. After a restart or
+HTTP 503, read the workflow status. If it shows `answer_accepted`, repeat
+`POST /tasks/{id}/workflow` with that revision to resume or reconcile the
+checkpoint. Concurrent recovery requests share the task lock.
+
+This workflow stops at `ready_for_extraction`. A missing or unavailable
+checkpoint store returns HTTP 503 from workflow actions. Run the explicit
+checkpoint setup before enabling these actions. Workbook extraction is
+tracked in issue #6.
 
 ## Tests
 
