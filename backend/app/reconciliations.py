@@ -1,6 +1,6 @@
 import json
 from typing import Annotated, Literal
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from anyio import to_thread
 from fastapi import APIRouter, HTTPException, Request
@@ -53,6 +53,7 @@ class ReconciliationDetails(BaseModel):
     revision: int
     extractor_version: str
     source_sha256: str
+    generation: UUID
     status: Literal["blocked", "ready_for_classification"]
     scope: ScopePolicy
     decisions: dict
@@ -101,7 +102,7 @@ async def record_outcome(
     identified_questions(extraction, scope, report)
     fields = {
         "status": report["status"], "scope": scope.model_dump(),
-        "decisions": decisions, "report": report,
+        "decisions": decisions, "report": report, "generation": uuid4(),
     }
     statement = insert(source_reconciliations).values(
         task_id=extraction.task_id, revision=extraction.revision, extractor_version=extraction.extractor_version,

@@ -207,7 +207,7 @@ that outlasts its request keeps its worker slot until it finishes. A failed extr
 records its error with no partial result, and a changed source or revision
 returns HTTP 409 before publication.
 
-Reconciliation and classification consume this evidence in later issues.
+Reconciliation and classification consume this evidence.
 
 ## Reconcile source totals and scope
 
@@ -261,8 +261,55 @@ D9 contributes D7 and D8 (60.00 − 10.00). D10 adds 25.00 and D11 adds
 changes, the working scope is 260.00.
 
 Source rules follow the approved specification mapped in the fixture guide,
-particularly sections II, III, VI and X. Classification and target allocation
-belong to later issues.
+particularly sections II, III, VI and X.
+
+## Classify trades and areas
+
+Set `CLASSIFICATION_SKILL_PATH` to the approved `SKILL.md` file and make the
+file available to the backend. For a container, mount it read-only and use
+its path inside the container. Configure `CLASSIFICATION_MODEL` with an
+OpenAI model that supports strict structured outputs, and supply `LLM_API_KEY`
+through the deployment secret or a private local environment. Enable the
+provider only for workbook evidence the company allows it to process.
+The request sends the full primary specification, current working-row
+descriptions, relevant source labels and Notes. The source workbook, target
+amount and operator credentials stay in the service. The supplementary
+`Invoice.Breakdown.Codex.md` file is optional for Issue #8.
+Run `alembic upgrade head` explicitly before enabling classification.
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /tasks/{id}/classification` | Send `expected_revision` after reconciliation is ready. Starts classification or returns the current result. Retry here after addressing a failed attempt. |
+| `GET /tasks/{id}/classification` | Read current assignments, evidence, pending questions, accepted answers and the SHA-256 of the primary specification. |
+| `POST /tasks/{id}/classification/answers` | Send `expected_revision`, the current `question_id`, one offered `answer` and a `reason` when required. |
+
+Classification carries forward the exact signed amount of each reconciled
+row and keeps a single coverage entry per row. The code checks the model's
+references and trade labels, row coverage and amount conservation.
+Semantic proposals retain their rationale and provenance for review. An
+owner's answer is recorded as a confirmed interpretation and carries no
+new price. Complete classification reaches `ready_for_allocation`.
+
+An explicitly priced Glazing component in the combined Partition row can
+be removed from the trusted parent amount when both use the same markup
+basis. The report records the parent price, component price, header,
+signed coefficient and subtraction. Unsupported splits require
+clarification. Identified area labels are retained as written, including
+combined floors. Rows without an area go to `Additional Items`; no
+separate floor amounts are invented.
+
+A conflict between an Access Panel exclusion note and a priced working
+row pauses classification. If the owner requests a scope change, make it in
+reconciliation before rerunning classification. Each scope or reconciliation
+decision change creates a new generation, invalidating earlier answers
+and assignments even if the task revision stays the same. Source and
+target revisions also invalidate prior classification. Pending answers
+can resume from the persisted proposal after restart.
+
+An unavailable provider, invalid proposal or missing primary specification
+records a failed outcome. The request supports up to 300 working rows and
+192 KiB of model input evidence. Limit failures stop the stage before
+publication. Tests use synthetic data and a simulated model.
 
 ## Tests
 
