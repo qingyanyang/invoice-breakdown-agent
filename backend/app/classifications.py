@@ -38,6 +38,7 @@ class ClassificationDetails(BaseModel):
     revision: int
     extractor_version: str
     reconciliation_generation: UUID
+    proposal_id: UUID
     source_sha256: str
     status: Literal["failed", "blocked", "ready_for_allocation"]
     classifier_version: str

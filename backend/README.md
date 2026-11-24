@@ -319,6 +319,56 @@ records a failed outcome. The request supports up to 300 working rows and
 192 KiB of model input evidence. Limit failures stop the stage before
 publication. Tests use synthetic data and a simulated model.
 
+## Allocate an authorized target
+
+Run the current classification until it returns `ready_for_allocation`.
+Use its `proposal_id` with the current revision to approve allocation.
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /tasks/{id}/allocation` | Send `expected_revision` and `expected_classification_id`. Runs allocation using the target and GST approval stored on the task. |
+| `GET /tasks/{id}/allocation` | Read the report for the current allocation inputs and approvals. |
+
+An optional `policy` supports `protected_rows` (working-scope row references),
+`rounding_preference` (a displayed `area` and `trade`), and
+`requested_direction` (`increase` or `decrease`). To change a previously
+recorded policy, submit its `allocation_id` as `expected_allocation_id`.
+Repeating the current policy returns the recorded result. A stale revision,
+classification, or policy approval returns HTTP 409.
+
+The primary rules are `SKILL.md` §§8–9 and 11. Working total **W** is the
+exact sum of the reconciled signed assignments, including all authorized
+additions. **P** is the exact sum of protected components within **W**.
+The adjustable base is **W − P**, and the uniform factor is
+**(T − P) / (W − P)** for approved ex-GST target **T**. Protected additions
+are recorded by origin. They enter the formula once through **W** and **P**.
+Default protection applies to Make Good and Access Panel. A protected
+row keeps its exact source amount, including in a mixed display cell.
+
+The allocation uses 512 significant decimal digits. Protected and adjustable
+subtotals in each area/trade cell are independently rounded to cents using
+ROUND_HALF_UP. The adjustable rounding uses the exact quotient of the factor's
+numerator and denominator to resolve ties. The maximum legitimate target
+residual is half a cent multiplied by the number of nonzero rounded components.
+The exact total must already reconcile before a residual can be applied.
+Use the eligible requested cell or the largest adjustable magnitude, with
+ties ordered by the area label and trade name. The residual changes only the
+adjustable display component and must preserve its sign or bring it to zero.
+Area, trade and grand totals all derive from those same displayed cells.
+A targeted result requires a displayed difference of `0.00`.
+
+An unconfirmed GST basis returns a workflow prerequisite. A target that needs
+a verified GST conversion, cannot cover protected amounts, or cannot be
+achieved under the current rules produces a blocked report with its cause.
+An opposite requested direction is recorded as a warning. A task with no
+target records `no_contract_price_adjustment` and a null factor. Its exact
+assignments pass through, and any two-decimal display discrepancy is recorded
+under source presentation rounding without applying a contract adjustment.
+
+Run `alembic upgrade head` to install the allocation table. The report
+persists the approved inputs, protection provenance, factor, component
+amounts and rounding checks for workbook generation.
+
 ## Tests
 
 From `backend/` with the virtual environment active:
