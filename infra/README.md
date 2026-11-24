@@ -1,6 +1,6 @@
-# Enterprise Knowledge Intelligence — Azure Infrastructure
+# AFLUX Invoice Breakdown Agent — Azure Infrastructure
 
-Independent Azure infrastructure for the portfolio SaaS **demo**. Resource group: **`rg-knowledge-intelligence-demo`**.
+Azure infrastructure for the Invoice Breakdown Agent portfolio demo. Resource group: **`rg-knowledge-intelligence-demo`**.
 
 | Concern | Value |
 | --- | --- |

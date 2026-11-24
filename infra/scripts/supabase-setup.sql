@@ -1,4 +1,4 @@
--- Manual Supabase setup for Enterprise Knowledge Intelligence.
+-- Manual Supabase setup for AFLUX Invoice Breakdown Agent.
 -- Run once in the Supabase SQL editor (or psql) against the shared project.
 -- Do NOT run via Azure Bicep.
 --
