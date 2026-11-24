@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 
 app = FastAPI(
-    title="Enterprise Knowledge Intelligence",
+    title="AFLUX Invoice Breakdown Agent",
     version="0.1.0",
 )
 
@@ -28,5 +28,6 @@ def health() -> dict[str, str]:
     return {
         "status": "healthy",
         "service": "knowledge-intelligence-api",
+        "name": app.title,
         "environment": settings.environment,
     }

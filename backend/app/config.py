@@ -1,10 +1,16 @@
+from typing import Annotated
+
+from pydantic import StringConstraints
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     environment: str = "development"
     database_url: str | None = None
-    postgres_schema: str = "knowledge_intelligence"
+    postgres_schema: Annotated[
+        str,
+        StringConstraints(pattern=r"^[a-z_][a-z0-9_]{0,62}$"),
+    ] = "invoice_breakdown"
     cors_allowed_origins: str = "http://localhost:5173"
     llm_api_key: str | None = None
     azure_storage_blob_endpoint: str | None = None

@@ -30,7 +30,7 @@ param environmentName string
 param databaseUrl string
 
 @description('PostgreSQL schema used by the application (search_path / Alembic).')
-param postgresSchema string = 'knowledge_intelligence'
+param postgresSchema string = 'invoice_breakdown'
 
 @secure()
 @description('External LLM API key. Only used when enableLlmApiKey is true.')

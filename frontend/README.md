@@ -1,6 +1,6 @@
 # Frontend
 
-React + TypeScript SPA (Vite) for Enterprise Knowledge Intelligence. Deploys to Azure Static Web Apps via `.github/workflows/frontend-cd.yml`.
+React + TypeScript status page for the AFLUX Invoice Breakdown Agent. It displays API connectivity. The headless workflow runs through the backend. This scaffold deploys to Azure Static Web Apps via `.github/workflows/frontend-cd.yml`.
 
 ## Stack
 
