@@ -74,7 +74,9 @@ category. `/health` remains available without PostgreSQL.
 
 The backend uses a 3-second PostgreSQL connection timeout, a 2-second pool
 checkout timeout, and a 2-second PostgreSQL statement timeout during the
-revision check. FastAPI disposes of the connection pool on shutdown. Run
+revision check. A 4-second client deadline covers the full database check,
+including the pool pre-ping. A stalled connection is discarded. FastAPI
+disposes of the connection pool on shutdown. Run
 migrations explicitly before starting database-backed operations.
 
 LangGraph checkpoint setup and workflow resume are tracked in issue #5.

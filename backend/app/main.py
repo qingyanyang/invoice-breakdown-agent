@@ -9,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import settings
 from app.database import (
     DatabaseConfigurationError,
-    create_database_engine,
+    create_application_engine,
     database_heads,
     repository_heads,
 )
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     engine = None
     try:
-        engine = create_database_engine(settings)
+        engine = create_application_engine(settings)
     except DatabaseConfigurationError as error:
         logger.warning("Database readiness unavailable: %s", error)
 
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         if engine is not None:
-            engine.dispose()
+            await engine.dispose()
 
 
 app = FastAPI(
@@ -65,16 +65,18 @@ def health() -> dict[str, str]:
 
 
 @app.get("/ready", responses={503: {"description": "Database readiness unavailable"}})
-def ready(request: Request, response: Response) -> dict[str, str]:
+async def ready(request: Request, response: Response) -> dict[str, str]:
     engine = request.app.state.database_engine
     if engine is not None:
         try:
             expected = repository_heads()
-            actual = database_heads(engine, settings.postgres_schema)
+            actual = await database_heads(engine, settings.postgres_schema)
         except CommandError:
             logger.warning(
                 "Database readiness unavailable: repository migration heads could not be read"
             )
+        except TimeoutError:
+            logger.warning("Database readiness check timed out")
         except SQLAlchemyError as error:
             logger.warning("Database readiness check failed: %s", type(error).__name__)
         else:

@@ -59,7 +59,7 @@ def test_readiness_requires_exact_head_match(
     isolated_settings.postgres_schema = "configured_schema"
     monkeypatch.setattr(main, "repository_heads", lambda: frozenset(expected))
 
-    def read_database_heads(_engine, schema):
+    async def read_database_heads(_engine, schema):
         assert schema == "configured_schema"
         return frozenset(actual)
 
@@ -75,6 +75,7 @@ def test_readiness_requires_exact_head_match(
     [
         (OperationalError(None, None, Exception("dev-credential")), "OperationalError"),
         (CommandError("dev-credential"), "repository migration heads could not be read"),
+        (TimeoutError("dev-credential"), "Database readiness check timed out"),
     ],
 )
 def test_readiness_sanitizes_failures(isolated_settings, monkeypatch, caplog, error, reason):
@@ -83,8 +84,13 @@ def test_readiness_sanitizes_failures(isolated_settings, monkeypatch, caplog, er
     def fail(*_args):
         raise error
 
-    method = "repository_heads" if isinstance(error, CommandError) else "database_heads"
-    monkeypatch.setattr(main, method, fail)
+    if isinstance(error, CommandError):
+        monkeypatch.setattr(main, "repository_heads", fail)
+    else:
+        async def fail_database_check(*args):
+            fail(*args)
+
+        monkeypatch.setattr(main, "database_heads", fail_database_check)
     with caplog.at_level(logging.WARNING), TestClient(main.app) as client:
         response = client.get("/ready")
         assert client.get("/health").status_code == 200
