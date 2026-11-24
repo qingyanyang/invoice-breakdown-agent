@@ -9,7 +9,7 @@ from app import classification_model, classifications
 from app.checkpoints import setup_checkpoints
 from app.classify import Proposal
 from app.config import settings
-from test_classification import SHEET, write_codex, write_skill
+from test_classification import SHEET, component_workbook, write_codex, write_skill
 from test_reconciliation import SHEET_NS, WORKSHEET, source_sheet
 from test_reconciliation_api import ALICE, BOB, create_source, establish_evidence, service, success
 
@@ -311,10 +311,48 @@ async def test_new_classifier_version_replaces_prior_ready_result(
         task_id, _ = await ready_task(client, source)
         path = f"/tasks/{task_id}/classification"
         with monkeypatch.context() as old_classifier:
-            old_classifier.setattr(classifications, "CLASSIFIER_VERSION", "1")
+            old_classifier.setattr(classifications, "CLASSIFIER_VERSION", "2")
             old = success(await client.post(path, headers=ALICE, json=START))
-            assert old["status"] == "ready_for_allocation" and old["classifier_version"] == "1"
+            assert old["status"] == "ready_for_allocation" and old["classifier_version"] == "2"
         assert (await client.get(path, headers=ALICE)).status_code == 404
         current = success(await client.post(path, headers=ALICE, json=START))
         assert current["classifier_version"] == classifications.CLASSIFIER_VERSION
         assert current["status"] == "ready_for_allocation" and len(calls) == 2
+
+
+@pytest.mark.anyio
+async def test_owner_must_confirm_combined_floor_before_classification_advances(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    combined = "Level 1 and Level 2"
+
+    async def model(_settings, _spec, inputs):
+        proposal = model_answer(inputs, {})
+        proposal.rows[0].area = combined
+        return proposal
+
+    monkeypatch.setattr(classification_model, "propose", model)
+    workbook = component_workbook(workbook_with, area=combined, parent="Hoarding")
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, workbook)
+        path = f"/tasks/{task_id}/classification"
+        draft = success(await client.post(path, headers=ALICE, json=START))
+        question, = draft["report"]["questions"]
+        assert (question["kind"], question["options"]) == ("area", [combined])
+        assert draft["status"] == "blocked"
+        assert draft["report"]["classified_total"] is None
+        assert draft["report"]["assignments"] == []
+        answer = {**START, "question_id": question["id"], "answer": combined}
+
+    async with service() as client:
+        assert success(await client.get(path, headers=ALICE)) == draft
+        assert (await client.post(path + "/answers", headers=BOB, json=answer)).status_code == 404
+        assert (await client.post(
+            path + "/answers", headers=ALICE, json={**answer, "answer": "Level 1"},
+        )).status_code == 422
+        ready = success(await client.post(path + "/answers", headers=ALICE, json=answer))
+        assert ready["status"] == "ready_for_allocation"
+        assert ready["report"]["classified_total"] == ready["report"]["working_scope_total"] == "110.00"
+        assignment, = ready["report"]["assignments"]
+        assert (assignment["area"], assignment["area_origin"]) == (combined, "operator_confirmed")

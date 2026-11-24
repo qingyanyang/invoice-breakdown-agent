@@ -6,11 +6,13 @@ from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.classification_evidence import ClassificationEvidence, ClassificationEvidenceError, GLAZING, GLAZING_EXCLUDED, stated_trade
+from app.classification_evidence import (
+    COMBINED_FLOORS, GLAZING, GLAZING_EXCLUDED, ClassificationEvidence, ClassificationEvidenceError, stated_trade,
+)
 from app.reconcile import cents
 from app.reconciliation_evidence import clean
 
-CLASSIFIER_VERSION = "2"
+CLASSIFIER_VERSION = "3"
 ADDITIONAL = "Additional Items"
 
 
@@ -155,13 +157,16 @@ class ClassificationRun:
             return ADDITIONAL, [], "unallocated"
         if len(candidates) == 1:
             area, refs = next(iter(candidates.items()))
-            if proposed_area is None or clean(proposed_area) == clean(area):
+            if COMBINED_FLOORS.fullmatch(area):
+                prompt = (
+                    f"The source amount at {key} covers {area} without a separate amount for each floor. "
+                    "Confirm keeping the combined attribution."
+                )
+            elif proposed_area is not None and clean(proposed_area) != clean(area):
+                prompt = f"The proposed area differs from the source label at {key}. Confirm the source attribution."
+            else:
                 return area, refs, "workbook"
-            area = self.ask(
-                "area", key,
-                f"The proposed area differs from the source label at {key}. Confirm the source attribution.",
-                [area], refs,
-            )
+            area = self.ask("area", key, prompt, [area], refs)
         else:
             area = self.ask(
                 "area", key, f"Which of the source area labels applies to {key}?",

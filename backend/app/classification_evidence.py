@@ -10,9 +10,9 @@ from app.reconciliation_evidence import SCOPE, Reference, WorkbookEvidence, clea
 AREA_HEADERS = {"area", "floor", "level", "floor area", "area floor", "location", "zone"}
 AREA_HEADING = re.compile(r"^(?:area|floor|level|zone)\s*:\s*(\S.*)$", re.I)
 FLOOR_LABEL = r"(?:(?:levels?|floors?)\s+\w+|(?:ground|lower ground|upper ground|first|second|third) floor|basement(?:\s+\w+)?)"
-FLOOR_HEADING = re.compile(
-    rf"^{FLOOR_LABEL}(?:\s*(?:and|&|/|\+|,|–|-)\s*(?:{FLOOR_LABEL}|[0-9]+[A-Za-z]?))*$", re.I,
-)
+ADDITIONAL_FLOOR = rf"\s*(?:\band\b|\bto\b|[&/+,–—-])\s*(?:{FLOOR_LABEL}|[0-9]+[A-Za-z]?)"
+FLOOR_HEADING = re.compile(rf"{FLOOR_LABEL}(?:{ADDITIONAL_FLOOR})*", re.I)
+COMBINED_FLOORS = re.compile(rf"{FLOOR_LABEL}(?:{ADDITIONAL_FLOOR})+", re.I)
 GLAZING_COMPONENT = r"(?:glazing(?: frames?)?|glass|mullions?)"
 GLAZING = re.compile(rf"\b{GLAZING_COMPONENT}\b")
 GLAZING_EXCLUDED = re.compile(

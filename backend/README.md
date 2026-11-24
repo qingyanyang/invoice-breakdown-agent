@@ -299,9 +299,10 @@ A priced Glazing component can be subtracted from the Partition parent
 when a workbook label establishes its inclusion and both use the same
 markup basis. The report records the parent, component, inclusion
 reference and subtraction. Unsupported splits require clarification.
-When a proposal differs from the only source area label, the owner can
-confirm the recorded attribution, including combined floors. Rows without
-an area go to `Additional Items`.
+When the only source attribution covers combined floors without separate
+amounts, the owner must confirm keeping the full amount on the combined
+label. A model proposal that differs from the only source area label also
+requires confirmation. Rows without an area go to `Additional Items`.
 
 A conflict between an Access Panel exclusion note and a priced working
 row pauses classification. If the owner requests a scope change, make it in

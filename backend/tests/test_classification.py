@@ -109,7 +109,7 @@ def test_mechanical_checks_reject_bad_coverage_and_references(workbook_with, cas
 
 
 def component_workbook(
-    workbook_with, component="33", area="Level 1 and Level 2", price_header="Glazing Amount Incl Markup",
+    workbook_with, component="33", area="Level 1", price_header="Glazing Amount Incl Markup",
     parent="Partition including glazing",
 ):
     def text(col, row, value):
@@ -125,16 +125,23 @@ def component_workbook(
 </sheetData></worksheet>""".encode()})
 
 
-def test_residual_split_keeps_markup_and_combined_area(workbook_with):
-    evidence = reconciled(extract_workbook(component_workbook(workbook_with)))
+@pytest.mark.parametrize("source_area,proposed_area", [
+    ("Level 1 and Level 2", "Level 1"),
+    ("Level 1 and Level 2", "Level 1 and Level 2"),
+    ("Level 1 and Level 2", None),
+    ("Levels 1–2", None),
+    ("Ground Floor / Level 2", None),
+])
+def test_residual_split_keeps_markup_and_combined_area(workbook_with, source_area, proposed_area):
+    evidence = reconciled(extract_workbook(component_workbook(workbook_with, area=source_area)))
     proposals = proposal_for(evidence, {
-        f"{SHEET}!D4": {"trade": "Partition", "glazing_price": f"{SHEET}!E4", "area": "Level 1"},
+        f"{SHEET}!D4": {"trade": "Partition", "glazing_price": f"{SHEET}!E4", "area": proposed_area},
     })
     draft = build_classification(evidence, proposals, {}, "proposal")
     question, = draft["questions"]
     assert draft["status"] == "blocked" and draft["assignments"] == []
     assert question["kind"] == "area"
-    assert question["options"] == ["Level 1 and Level 2"]
+    assert question["options"] == [source_area]
     assert question["evidence"] == [f"{SHEET}!F4", f"{SHEET}!F3"]
     report = build_classification(evidence, proposals, {question["key"]: {"answer": question["options"][0]}}, "proposal")
     assert report["status"] == "ready_for_allocation"
@@ -146,7 +153,7 @@ def test_residual_split_keeps_markup_and_combined_area(workbook_with):
     assert (glazing["trade"], glazing["amount"]) == ("Glazing", "33")
     assert partition["trade"] == "Partition" and Decimal(partition["amount"]) == Decimal("77")
     for piece in (glazing, partition):
-        assert piece["area"] == "Level 1 and Level 2"
+        assert piece["area"] == source_area
         assert piece["area_evidence"] == [f"{SHEET}!F4", f"{SHEET}!F3"]
         assert piece["area_origin"] == "operator_confirmed"
         assert piece["markup_treatment"] == "included"
@@ -192,7 +199,7 @@ def test_explicit_component_header_can_confirm_inclusion_but_cannot_override_exc
     for parent, expected in [("Partition", "ready_for_allocation"), ("Partition without glazing", "blocked")]:
         evidence = reconciled(extract_workbook(component_workbook(workbook_with, parent=parent, price_header=header)))
         proposal = proposal_for(evidence, {f"{SHEET}!D4": {
-            "trade": "Partition", "glazing_price": f"{SHEET}!E4", "area": "Level 1 and Level 2",
+            "trade": "Partition", "glazing_price": f"{SHEET}!E4", "area": "Level 1",
         }})
         report = build_classification(evidence, proposal, {}, "proposal")
         assert report["status"] == expected
