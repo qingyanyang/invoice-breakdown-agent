@@ -1,13 +1,14 @@
 from alembic import context
+from sqlalchemy.engine import Engine
 from sqlalchemy.schema import CreateSchema
 
 from app.config import settings
-from app.database import engine, metadata
+from app.database import create_database_engine, metadata
 
 schema = settings.postgres_schema
 
 
-def run_migrations() -> None:
+def run_migrations(engine: Engine) -> None:
     if context.is_offline_mode():
         context.configure(
             dialect_name=engine.dialect.name,
@@ -34,4 +35,8 @@ def run_migrations() -> None:
             context.run_migrations()
 
 
-run_migrations()
+engine = create_database_engine(settings)
+try:
+    run_migrations(engine)
+finally:
+    engine.dispose()

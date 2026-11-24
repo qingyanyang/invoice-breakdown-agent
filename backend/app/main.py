@@ -1,11 +1,42 @@
-from fastapi import FastAPI
+import logging
+from contextlib import asynccontextmanager
+
+from alembic.util import CommandError
+from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
+from app.database import (
+    DatabaseConfigurationError,
+    create_database_engine,
+    database_heads,
+    repository_heads,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    engine = None
+    try:
+        engine = create_database_engine(settings)
+    except DatabaseConfigurationError as error:
+        logger.warning("Database readiness unavailable: %s", error)
+
+    app.state.database_engine = engine
+    try:
+        yield
+    finally:
+        if engine is not None:
+            engine.dispose()
+
 
 app = FastAPI(
     title="AFLUX Invoice Breakdown Agent",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 origins = [
@@ -31,3 +62,27 @@ def health() -> dict[str, str]:
         "name": app.title,
         "environment": settings.environment,
     }
+
+
+@app.get("/ready", responses={503: {"description": "Database readiness unavailable"}})
+def ready(request: Request, response: Response) -> dict[str, str]:
+    engine = request.app.state.database_engine
+    if engine is not None:
+        try:
+            expected = repository_heads()
+            actual = database_heads(engine, settings.postgres_schema)
+        except CommandError:
+            logger.warning(
+                "Database readiness unavailable: repository migration heads could not be read"
+            )
+        except SQLAlchemyError as error:
+            logger.warning("Database readiness check failed: %s", type(error).__name__)
+        else:
+            if expected and actual == expected:
+                return {"status": "ready"}
+            logger.warning(
+                "Database readiness unavailable: migration revisions do not match repository heads"
+            )
+
+    response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"status": "not_ready"}
