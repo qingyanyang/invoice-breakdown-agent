@@ -26,8 +26,8 @@ param llmApiKey string = ''
 @description('When true, wire ACA secret llm-api-key. Set from deploy scripts when LLM_API_KEY is present — do not derive via empty(secure).')
 param enableLlmApiKey bool = false
 
-@description('PostgreSQL schema used by FastAPI / Alembic (Supabase). Shared project with Agent Platform; isolate via schema.')
-param postgresSchema string = 'knowledge_intelligence'
+@description('PostgreSQL schema used by FastAPI / Alembic (Supabase).')
+param postgresSchema string = 'invoice_breakdown'
 
 @description('When false (Phase 1), skip Container App until a public GHCR image exists.')
 param deployContainerApp bool = true

@@ -20,12 +20,12 @@ param tags = {
 // DATABASE_URL: use Supabase *session pooler* connection string (IPv4-friendly), e.g.
 //   postgresql+psycopg://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
 // Prefer building/encoding the URL in your secret store; never commit it.
-// Schema isolation (shared Supabase project with Agent Platform): knowledge_intelligence
+// PostgreSQL schema for the Invoice Breakdown Agent.
 param databaseUrl = readEnvironmentVariable('DATABASE_URL', '')
 param llmApiKey = readEnvironmentVariable('LLM_API_KEY', '')
 // Non-secure gate: empty(@secure()) is unreliable in ARM, so scripts/CI set this explicitly.
 param enableLlmApiKey = false
-param postgresSchema = 'knowledge_intelligence'
+param postgresSchema = 'invoice_breakdown'
 
 // Phase 1: false — no Container App until a public GHCR image exists.
 // Phase 2: set true + containerImage = 'ghcr.io/qingyanyang/knowledge-intelligence-api:latest'

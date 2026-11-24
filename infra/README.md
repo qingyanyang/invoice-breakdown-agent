@@ -10,13 +10,13 @@ Azure infrastructure for the Invoice Breakdown Agent portfolio demo. Resource gr
 | GitHub Environment | `demo` |
 | Data plane / API region | `australiasoutheast` |
 | Static Web Apps region | `eastasia` |
-| Database | **External Supabase PostgreSQL** + pgvector (schema `knowledge_intelligence`) |
+| Database | **External Supabase PostgreSQL** (schema `invoice_breakdown`) |
 | Container images | **Public GHCR** (`ghcr.io/<user>/<image>:<tag>`) |
 | Secrets (MVP) | Container Apps secrets + GitHub Environment secrets (no Key Vault) |
 
 **Do not deploy to Azure until you explicitly approve a live deployment.**
 
-Shares one Supabase project with Agent Platform; isolation is by **PostgreSQL schema** (`knowledge_intelligence` vs `agent_platform`).
+The Invoice Breakdown Agent uses its own Supabase project and defaults to the `invoice_breakdown` schema.
 
 ---
 
@@ -32,7 +32,7 @@ flowchart LR
   end
 
   subgraph external [External]
-    SUPA[(Supabase Postgres\nschema knowledge_intelligence)]
+    SUPA[(Supabase Postgres\nschema invoice_breakdown)]
     GHCR[GHCR public image]
   end
 
@@ -78,7 +78,7 @@ Azure PostgreSQL and ACR are **not** provisioned by this stack (database is Supa
 
 1. **Bootstrap** — create `rg-knowledge-intelligence-demo`.
 2. **Phase 1** — `deployContainerApp = false`: LAW, App Insights, Storage, UAMI, CAE, SWA (no Container App yet).
-3. **Manual once** — GitHub OIDC + RBAC; run [`scripts/supabase-setup.sql`](scripts/supabase-setup.sql); build/push a **public** GHCR image.
+3. **Manual once** — GitHub OIDC + RBAC; apply [the backend migrations](../backend/README.md#supabase-migrations-and-startup); build/push a **public** GHCR image.
 4. **Phase 2** — enable Container App (see below), redeploy infra.
 5. **Ongoing** — `backend-cd` / `frontend-cd`. Prefer app CD over full infra CD.
 
@@ -119,18 +119,11 @@ The Container App is **not** created in Phase 1. To provision it:
 
 ---
 
-## Supabase (manual)
+## Supabase
 
-Bicep does **not** create schemas or DB users. Run once against the shared project:
+Bicep passes `POSTGRES_SCHEMA` to the Container App. Run [the backend migrations](../backend/README.md#supabase-migrations-and-startup) with credentials for the target Supabase project before deploying database-backed features. Alembic creates the configured schema and keeps its version table there. Use [the verification query](scripts/supabase-setup.sql) to check the default schema in the SQL editor.
 
-```sql
-CREATE SCHEMA IF NOT EXISTS knowledge_intelligence;
-CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
-```
-
-Full notes (Alembic `version_table_schema`, grants): [`scripts/supabase-setup.sql`](scripts/supabase-setup.sql).
-
-Prefer the **session pooler** host in `DATABASE_URL` (IPv4-friendly). Set `POSTGRES_SCHEMA=knowledge_intelligence` (non-secret env on the Container App) so SQLAlchemy/Alembic stay isolated from `agent_platform`.
+Use a direct connection or session pooler for the backend and migrations. The current baseline requires no extensions.
 
 ---
 
