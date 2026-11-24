@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from alembic.util import CommandError
+from anyio import CapacityLimiter
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
@@ -13,6 +14,7 @@ from app.database import (
     database_heads,
     repository_heads,
 )
+from app.extractions import router as extraction_router
 from app.operators import operator_credentials
 from app.source_storage import create_source_storage
 from app.tasks import router as task_router
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI):
         logger.warning("Database readiness unavailable: %s", error)
 
     app.state.database_engine = engine
+    app.state.extraction_limiter = CapacityLimiter(1)
     app.state.source_storage = None
     try:
         app.state.operator_credentials = operator_credentials(settings.operator_tokens)
@@ -56,6 +59,7 @@ app = FastAPI(
 )
 app.include_router(task_router)
 app.include_router(workflow_router)
+app.include_router(extraction_router)
 
 origins = [
     origin.strip()
