@@ -18,7 +18,7 @@ from app.workbook_source import MAIN, S, XML_SPACE, WorkbookProblem, parse, seri
 SUMMARY = "Invoice Breakdown"
 ADJUSTMENT = "Adjustment Detail"
 EVIDENCE = "Source Evidence"
-TEMPLATE_VERSION = "3"
+TEMPLATE_VERSION = "4"
 EVIDENCE_LINES_PER_ROW = 24
 MONEY = "$#,##0.00"
 DATE = "dd/mm/yyyy"
@@ -140,7 +140,9 @@ class Worksheet:
                 text.text = cell.value
                 width = max(1, self.widths[index - 1] - 2)
                 line_count = max(line_count, sum(max(1, ceil(len(line) / width)) for line in cell.value.split("\n")))
-        height = min(409, max(30 if any(isinstance(c, Cell) and c.style == "title" for c in values) else 16, line_count * 15))
+        minimum_height = 30 if any(isinstance(c, Cell) and c.style == "title" for c in values) else 16
+        # Leave room for Calc's line spacing when wrapped text is rendered to PDF.
+        height = min(409, max(minimum_height, 16 + (line_count - 1) * 17))
         row.attrib.update({"ht": str(height), "customHeight": "1"})
         return self.row_number
 

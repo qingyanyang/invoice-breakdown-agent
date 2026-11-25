@@ -1,7 +1,6 @@
 """Prove that each workbook cell's text is actually painted in its preview region."""
 
 import re
-import os
 import unicodedata
 from collections import defaultdict
 from copy import deepcopy
@@ -25,8 +24,10 @@ from app.workbook_source import S, parse, serialize
 MAX_PAGE_POINTS = 14_400
 MAX_STYLES = 65_490
 MARKER_START = 0x110001
-# The renderer rounds PDF coordinates to thousandths of a point and clips its outer margins.
-PDF_TOLERANCE = 0.15
+# A glyph's advance box can extend fractionally past its cell background.
+CELL_TOLERANCE = 0.5
+# Keep clipping and visible-page bounds stricter than cell placement.
+CLIP_TOLERANCE = 0.15
 MONEY_FORMAT = re.compile(r"(?P<symbol>\$)?(?P<int>[#0,]+)(?:\.(?P<decimals>0+))?(?P<percent>%)?")
 DATE_FORMATS = {
     "dd/mm/yyyy": "%d/%m/%Y", "d/m/yyyy": "%-d/%-m/%Y", "mm/dd/yyyy": "%m/%d/%Y",
@@ -167,10 +168,10 @@ def intersection(first, second):
     return (left, bottom, right, top) if left < right and bottom < top else None
 
 
-def contains(outer, inner):
+def contains(outer, inner, tolerance):
     return outer is not None and (
-        outer[0] - PDF_TOLERANCE <= inner[0] <= inner[2] <= outer[2] + PDF_TOLERANCE
-        and outer[1] - PDF_TOLERANCE <= inner[1] <= inner[3] <= outer[3] + PDF_TOLERANCE
+        outer[0] - tolerance <= inner[0] <= inner[2] <= outer[2] + tolerance
+        and outer[1] - tolerance <= inner[1] <= inner[3] <= outer[3] + tolerance
     )
 
 
@@ -208,7 +209,6 @@ class PreviewPaint(PDFTextDevice):
         self.regions.extend(self.cell_refs)
         self.text = defaultdict(list)
         self.painted = False
-        self.probe = []
 
     def paint_path(self, gstate, stroke, fill, evenodd, path):
         if self.marker_colors is None or not fill or gstate.ncs.name != "DeviceRGB":
@@ -234,10 +234,11 @@ class PreviewPaint(PDFTextDevice):
             text = "\ufffd"
         if self.painted and text.strip():
             glyph = LTChar(matrix, font, fontsize, scaling, rise, text, width, font.char_disp(cid), ncs, graphicstate)
-            if os.getenv("TEST_QA_WORKER_IMAGE"):
-                self.probe.append((text, tuple(round(i, 2) for i in glyph.bbox), self.clip))
-            if contains(self.clip, glyph.bbox):
-                cells = [cell for cell in self.regions.find(glyph.bbox) if contains(cell.bbox, glyph.bbox)]
+            if contains(self.clip, glyph.bbox, CLIP_TOLERANCE):
+                cells = [
+                    cell for cell in self.regions.find(glyph.bbox)
+                    if contains(cell.bbox, glyph.bbox, CELL_TOLERANCE)
+                ]
                 if len(cells) == 1:
                     self.text[self.cell_refs[cells[0]]].append(text)
         return width * fontsize * scaling
@@ -277,18 +278,6 @@ def verify_preview(book, pdf, measured, colors, witnesses):
                 location(sheet.name, ref) for ref, value in expected.items()
                 if text_key("".join(paint.text.get(ref, ()))) != value
             )
-            if os.getenv("TEST_QA_WORKER_IMAGE"):
-                for ref, value in expected.items():
-                    found = text_key("".join(paint.text.get(ref, ())))
-                    if found == value:
-                        continue
-                    candidates = marker_paint.marker_boxes.get(ref)
-                    print("QA_PROBE", sheet.name, ref, repr(value), repr(found), candidates, flush=True)
-                    if ref in {"A1", "A2", "D3", "D6", "D7"} and candidates:
-                        left, bottom, right, top = next(iter(candidates))
-                        nearby = [(t, box, clip) for t, box, clip in paint.probe
-                                  if left - 9 < box[0] < right + 15 and bottom - 4 < box[1] < top + 4]
-                        print("QA_GLYPHS", sheet.name, ref, nearby[:180], flush=True)
             report.append({
                 "sheet": sheet.name, "visibility": sheet.state, "page": page_no,
                 "range": populated_range(list(expected)), "populated_cells": len(expected),
