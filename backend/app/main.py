@@ -20,8 +20,9 @@ from app.extractions import SourceReadWorker
 from app.extractions import router as extraction_router
 from app.operators import operator_credentials
 from app.reconciliations import router as reconciliation_router
-from app.source_storage import create_source_storage
+from app.source_storage import create_output_storage, create_source_storage
 from app.tasks import router as task_router
+from app.workbooks import router as workbook_router
 from app.workflows import router as workflow_router
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,8 @@ async def lifespan(app: FastAPI):
     app.state.extraction_limiter = CapacityLimiter(1)
     app.state.extraction_source_reader = SourceReadWorker()
     app.state.source_storage = None
+    app.state.output_storage = None
+    app.state.workbook_limiter = CapacityLimiter(1)
     try:
         app.state.operator_credentials = operator_credentials(settings.operator_tokens)
     except ValueError as error:
@@ -49,11 +52,17 @@ async def lifespan(app: FastAPI):
     except ValueError:
         logger.warning("Source storage configuration is invalid")
     try:
+        app.state.output_storage = create_output_storage(settings)
+    except ValueError:
+        logger.warning("Workbook storage configuration is invalid")
+    try:
         yield
     finally:
         await app.state.extraction_source_reader.close()
         if app.state.source_storage is not None:
             app.state.source_storage.close()
+        if app.state.output_storage is not None:
+            app.state.output_storage.close()
         if engine is not None:
             await engine.dispose()
 
@@ -69,6 +78,7 @@ app.include_router(extraction_router)
 app.include_router(reconciliation_router)
 app.include_router(classification_router)
 app.include_router(allocation_router)
+app.include_router(workbook_router)
 
 origins = [
     origin.strip()

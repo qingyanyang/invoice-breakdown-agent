@@ -26,6 +26,10 @@ class SourceIntegrityError(StorageError):
     pass
 
 
+class StorageNotFound(StorageError):
+    pass
+
+
 class SourceStorage(Protocol):
     def put(self, key: str, data: bytes) -> None: ...
     def read(self, key: str, size: int) -> bytes: ...
@@ -64,7 +68,8 @@ class LocalSourceStorage:
                     temporary.unlink(missing_ok=True)
                 except OSError:
                     logger.warning(
-                        "Source staging cleanup pending for key %s",
+                        "%s staging cleanup pending for key %s",
+                        "Workbook" if key.startswith("outputs/") else "Source",
                         (destination.parent.relative_to(self.directory) / temporary.name).as_posix(),
                     )
 
@@ -72,6 +77,8 @@ class LocalSourceStorage:
         try:
             with (self.directory / key).open("rb") as handle:
                 return handle.read(size + 1)
+        except FileNotFoundError:
+            raise StorageNotFound from None
         except OSError:
             raise StorageError from None
 
@@ -86,7 +93,7 @@ class LocalSourceStorage:
 
 
 class AzureSourceStorage:
-    def __init__(self, config: Settings):
+    def __init__(self, config: Settings, *, container: str | None = None):
         self.credential = ManagedIdentityCredential(client_id=config.azure_client_id)
         self.service = BlobServiceClient(
             config.azure_storage_blob_endpoint,
@@ -95,7 +102,8 @@ class AzureSourceStorage:
             read_timeout=15,
             retry_total=1,
         )
-        self.container = self.service.get_container_client(config.azure_storage_documents_container)
+        container_name = config.azure_storage_documents_container if container is None else container
+        self.container = self.service.get_container_client(container_name)
 
     def put(self, key: str, data: bytes) -> None:
         try:
@@ -108,6 +116,8 @@ class AzureSourceStorage:
     def read(self, key: str, size: int) -> bytes:
         try:
             return self.container.download_blob(key, offset=0, length=size + 1).readall()
+        except ResourceNotFoundError:
+            raise StorageNotFound from None
         except AzureError:
             raise StorageError from None
 
@@ -127,6 +137,14 @@ class AzureSourceStorage:
 def create_source_storage(config: Settings) -> SourceStorage | None:
     if config.azure_storage_blob_endpoint:
         return AzureSourceStorage(config)
+    if config.source_storage_directory:
+        return LocalSourceStorage(config.source_storage_directory)
+    return None
+
+
+def create_output_storage(config: Settings) -> SourceStorage | None:
+    if config.azure_storage_blob_endpoint:
+        return AzureSourceStorage(config, container=config.azure_storage_processed_documents_container)
     if config.source_storage_directory:
         return LocalSourceStorage(config.source_storage_directory)
     return None

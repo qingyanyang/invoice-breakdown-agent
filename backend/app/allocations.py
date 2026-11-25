@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from app.allocation import ALLOCATION_VERSION, AllocationPolicy, allocate
 from app.allocation_tables import source_allocations
 from app.classifications import ClassificationDetails, classification_inputs, classification_record, identity
+from app.extractions import ExtractionDetails
 from app.operators import Operator
 from app.reconcile import amount_text
 from app.reconciliations import ReconciliationDetails
@@ -49,6 +50,7 @@ class AllocationDetails(BaseModel):
 
 @dataclass(frozen=True)
 class AllocationInputs:
+    extraction: ExtractionDetails
     reconciliation: ReconciliationDetails
     classification: ClassificationDetails
     target: Decimal | None
@@ -73,12 +75,12 @@ async def current_inputs(connection: AsyncConnection, revision) -> AllocationInp
     workflow = workflow_details(revision, await workflow_record(connection, revision))
     if revision["target_amount"] is not None and workflow.effective_gst_basis is None:
         raise HTTPException(409, "Confirm the target GST basis in the current revision workflow")
-    _, reconciliation = await classification_inputs(connection, revision)
+    extraction, reconciliation = await classification_inputs(connection, revision)
     classified = await classification_record(connection, reconciliation)
     if classified is None or classified["status"] != "ready_for_allocation":
         raise HTTPException(409, "Current revision requires a ready classification")
     return AllocationInputs(
-        reconciliation, ClassificationDetails.model_validate(classified), revision["target_amount"],
+        extraction, reconciliation, ClassificationDetails.model_validate(classified), revision["target_amount"],
         workflow.effective_gst_basis, workflow.question.id if workflow.question else None,
     )
 
