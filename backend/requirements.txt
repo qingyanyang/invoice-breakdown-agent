@@ -8,6 +8,7 @@ azure-identity
 azure-storage-blob
 defusedxml
 lxml>=6,<7
+pdfminer.six==20260107
 httpx
 langgraph>=1,<2
 langgraph-checkpoint-postgres>=3,<4

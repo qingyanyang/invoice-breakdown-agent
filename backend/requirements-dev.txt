@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest
 openpyxl>=3.1,<4
+pypdf>=6,<7

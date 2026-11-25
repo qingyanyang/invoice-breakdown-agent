@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     classification_model: str | None = None
     classification_skill_path: Path | None = None
     classification_codex_path: Path | None = None
+    qa_worker_image: str | None = None
+    qa_docker_runtime: str = "docker"
     operator_tokens: SecretStr | None = None
     source_storage_directory: Path | None = None
     azure_client_id: str | None = None

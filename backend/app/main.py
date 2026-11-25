@@ -16,9 +16,11 @@ from app.database import (
     database_heads,
     repository_heads,
 )
+from app.delivery import router as delivery_router
 from app.extractions import SourceReadWorker
 from app.extractions import router as extraction_router
 from app.operators import operator_credentials
+from app.qa_engine import QAEngine
 from app.reconciliations import router as reconciliation_router
 from app.source_storage import create_output_storage, create_source_storage
 from app.tasks import router as task_router
@@ -42,6 +44,8 @@ async def lifespan(app: FastAPI):
     app.state.source_storage = None
     app.state.output_storage = None
     app.state.workbook_limiter = CapacityLimiter(1)
+    app.state.qa_limiter = CapacityLimiter(1)
+    app.state.qa_engine = QAEngine(settings.qa_docker_runtime, settings.qa_worker_image)
     try:
         app.state.operator_credentials = operator_credentials(settings.operator_tokens)
     except ValueError as error:
@@ -79,6 +83,7 @@ app.include_router(reconciliation_router)
 app.include_router(classification_router)
 app.include_router(allocation_router)
 app.include_router(workbook_router)
+app.include_router(delivery_router)
 
 origins = [
     origin.strip()
