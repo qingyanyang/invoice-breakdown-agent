@@ -1,5 +1,8 @@
 import logging
 import os
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -37,6 +40,40 @@ class SourceStorage(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(frozen=True)
+class StorageWriteOutcome:
+    state: str
+    error: Exception | None = None
+
+
+_write_acknowledgment: ContextVar[Callable[[], None] | None] = ContextVar("storage_write_acknowledgment", default=None)
+
+
+def acknowledge_write():
+    if acknowledgment := _write_acknowledgment.get():
+        acknowledgment()
+
+
+def write_with_outcome(storage: SourceStorage, key: str, data: bytes) -> StorageWriteOutcome:
+    confirmed = False
+
+    def mark_committed():
+        nonlocal confirmed
+        confirmed = True
+
+    acknowledgment = _write_acknowledgment.set(mark_committed)
+    try:
+        storage.put(key, data)
+    except SourceAlreadyExists as error:
+        return StorageWriteOutcome("collision", error)
+    except Exception as error:
+        # A backend may have proved ownership before a later transport or cleanup failure.
+        return StorageWriteOutcome("written" if confirmed else "unconfirmed", error)
+    finally:
+        _write_acknowledgment.reset(acknowledgment)
+    return StorageWriteOutcome("written")
+
+
 class LocalSourceStorage:
     def __init__(self, directory: Path):
         self.directory = directory
@@ -58,6 +95,7 @@ class LocalSourceStorage:
                 os.fsync(handle.fileno())
             try:
                 os.link(temporary, destination)
+                acknowledge_write()
             except FileExistsError:
                 raise SourceAlreadyExists from None
         except OSError:
@@ -108,6 +146,7 @@ class AzureSourceStorage:
     def put(self, key: str, data: bytes) -> None:
         try:
             self.container.upload_blob(key, data, overwrite=False)
+            acknowledge_write()
         except ResourceExistsError:
             raise SourceAlreadyExists from None
         except AzureError:

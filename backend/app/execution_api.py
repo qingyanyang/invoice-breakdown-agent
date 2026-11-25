@@ -4,8 +4,9 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Query, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from app.execution import effective_state
 from app.execution_tables import execution_runs
 from app.operators import Operator
 from app.tasks import database_for, owned_revision, transaction
@@ -29,4 +30,12 @@ async def read_executions(
             execution_runs.c.task_id == task_id, execution_runs.c.revision == current["revision"],
             execution_runs.c.operator == operator,
         ).order_by(execution_runs.c.updated_at.desc(), execution_runs.c.id).limit(50))
-        return [dict(row) for row in result.mappings()]
+        now = await connection.scalar(select(func.clock_timestamp()))
+        history = []
+        for row in result.mappings():
+            state = effective_state(row, now)
+            history.append(dict(row) | {
+                "status": state.status, "retry_at": state.retry_at,
+                "failure_code": state.failure_code, "exhaustion_reason": state.exhaustion_reason,
+            })
+        return history

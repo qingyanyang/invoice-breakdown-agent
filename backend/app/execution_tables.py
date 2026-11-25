@@ -15,6 +15,7 @@ request_receipts = Table(
     Column("operation", String(40), primary_key=True),
     Column("key_sha256", String(64), primary_key=True),
     Column("payload_sha256", String(64), nullable=False),
+    Column("context_sha256", String(64)),
     Column("response", JSONB(none_as_null=True)),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
@@ -57,4 +58,9 @@ execution_objects = Table(
     Column("storage_key", String(150), primary_key=True),
     Column("execution_id", Uuid, ForeignKey("execution_runs.id"), nullable=False),
     Column("attempt", Integer, nullable=False),
+    Column("write_state", String(16), nullable=False, server_default="unconfirmed"),
+    CheckConstraint(
+        "write_state IN ('pending', 'written', 'collision', 'unconfirmed')",
+        name="ck_execution_object_write_state",
+    ),
 )

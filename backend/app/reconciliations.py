@@ -15,7 +15,7 @@ from app.extractions import ExtractionDetails, extraction_record
 from app.operators import Operator
 from app.reconcile import reconcile
 from app.reconciliation_tables import source_reconciliations
-from app.request_receipts import ReceiptKey, RequestKey, save_receipt
+from app.request_receipts import ReceiptKey, RequestKey, bind_receipt_context, fingerprint, save_receipt
 from app.tasks import database_for, lock_current_revision, owned_revision, reserve_owned_receipt, transaction
 from app.workflows import RevisionRequest
 
@@ -149,6 +149,7 @@ async def apply_reconciliation(task_id, payload, request, operator, idempotency_
     engine = database_for(request)
     operation = "reconciliation_answer" if isinstance(payload, ReconciliationAnswer) else "reconciliation"
     key = ReceiptKey.from_request(operator, operation, idempotency_key, [task_id, payload])
+    original_context = None
 
     async def snapshot(connection):
         revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
@@ -156,14 +157,20 @@ async def apply_reconciliation(task_id, payload, request, operator, idempotency_
         return revision, extraction, await reconciliation_record(connection, extraction)
 
     async def prepare(connection):
+        nonlocal original_context
         if (receipt := await reserve_owned_receipt(connection, task_id, key)) is not None:
             return ReconciliationDetails.model_validate(receipt), None
         revision, extraction, current = await snapshot(connection)
+        source = [extraction.source_sha256, extraction.extractor_version, current.generation if current else None]
+        context = fingerprint(source)
+        if original_context is not None and context != original_context:
+            raise HTTPException(409, "Reconciliation inputs have changed")
+        original_context = context
+        await bind_receipt_context(connection, key, context)
         scope, decisions = reconciliation_change(payload, current, operator)
         if current and current.scope == scope and current.decisions == decisions:
             return await save_receipt(connection, key, current), None
-        material = [extraction.source_sha256, extraction.extractor_version, current.generation if current else None,
-                    scope, decisions]
+        material = [*source, scope, decisions]
         attempt = await claim(connection, revision, operator, operation, material, settings.execution_rules_seconds)
         return (extraction, current, scope, decisions), attempt
 

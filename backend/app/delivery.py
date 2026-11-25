@@ -16,7 +16,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.execution import (
-    ExecutionFailure, acquire, claim, executing, fence, final_object_key, forget_colliding_object, object_has_live_attempt, register_object, settle,
+    ExecutionFailure, acquire, claim, executing, fence, object_may_be_discarded, register_object, settle,
+    write_registered_object,
 )
 from app.operators import Operator
 from app.qa_checks import CHECKS, MACHINE_CHECKS, QA_VERSION, QAResult, default_checks, inspect_workbook, outcome, review_preview
@@ -243,7 +244,7 @@ async def discard_unreferenced_qa(engine, storage, task_id, key):
             workbook_qa_runs.c.candidate["storage_key"].astext == key,
             workbook_qa_runs.c.preview["storage_key"].astext == key,
         )).limit(1))
-        if referenced is not None or await object_has_live_attempt(connection, final_object_key(key)):
+        if referenced is not None or not await object_may_be_discarded(connection, key):
             return False
     await to_thread.run_sync(storage.delete, key)
     return True
@@ -320,10 +321,9 @@ async def start_qa(task_id: UUID, payload: QARequest, request: Request, operator
         await register_object(engine, attempt, key)
         written.append(key)
         try:
-            await request.app.state.storage_worker.run(storage.put, key, data, write_key=key)
+            await write_registered_object(engine, attempt, request.app.state.storage_worker, storage, key, data)
         except SourceAlreadyExists:
             written.remove(key)
-            await forget_colliding_object(engine, attempt, key)
             raise
         await verify_object(request, storage, descriptor)
         return descriptor

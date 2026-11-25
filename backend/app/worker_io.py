@@ -13,8 +13,9 @@ class BlockingWorker:
         self.executor = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix=name)
         self.slots = asyncio.Semaphore(capacity)
         self.writes: set[str] = set()
+        self.completions: set[asyncio.Task] = set()
 
-    async def run(self, function, *args, write_key: str | None = None):
+    async def run(self, function, *args, write_key: str | None = None, complete=None):
         await self.slots.acquire()
         try:
             job = asyncio.get_running_loop().run_in_executor(self.executor, function, *args)
@@ -24,8 +25,13 @@ class BlockingWorker:
         if write_key is not None:
             self.writes.add(write_key)
 
+        if complete is not None:
+            job = asyncio.create_task(self.complete_job(job, complete))
+            self.completions.add(job)
+
         def finished(future):
             self.slots.release()
+            self.completions.discard(future)
             if write_key is not None:
                 self.writes.discard(write_key)
             if not future.cancelled():
@@ -35,8 +41,16 @@ class BlockingWorker:
         # The actual worker retains the slot until the native call returns.
         return await asyncio.shield(job)
 
+    @staticmethod
+    async def complete_job(job, complete):
+        result = await job
+        await complete(result)
+        return result
+
     async def close(self):
         await to_thread.run_sync(self.executor.shutdown)
+        if self.completions:
+            await asyncio.gather(*self.completions, return_exceptions=True)
 
 
 class SourceReadWorker(BlockingWorker):

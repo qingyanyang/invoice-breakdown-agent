@@ -4,7 +4,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from math import ceil
 from pathlib import PurePosixPath
 from time import monotonic
@@ -13,13 +13,14 @@ from uuid import UUID, uuid4
 from anyio import CancelScope, fail_after
 from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
 from app.execution_tables import execution_objects, execution_runs
 from app.request_receipts import fingerprint
+from app.source_storage import write_with_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,16 @@ class Attempt:
         )
 
     @property
+    def live_filters(self):
+        clock = func.clock_timestamp()
+        return (
+            *self.filters,
+            execution_runs.c.lease_expires_at > clock,
+            execution_runs.c.attempt_expires_at > clock,
+            execution_runs.c.deadline > clock,
+        )
+
+    @property
     def headers(self):
         return {"X-Execution-Id": str(self.id)}
 
@@ -99,6 +110,48 @@ class Unavailable:
         return HTTPException(status_code, detail, headers=headers)
 
 
+@dataclass(frozen=True)
+class ExecutionState:
+    status: str
+    failure_code: str | None
+    exhaustion_reason: str | None = None
+    retry_at: datetime | None = None
+
+
+def active_until(row):
+    return min(row["lease_expires_at"], row["attempt_expires_at"], row["deadline"])
+
+
+def retry_delay(attempt_number):
+    return timedelta(seconds=settings.execution_retry_base_seconds * 2 ** (attempt_number - 1))
+
+
+def effective_state(row, now) -> ExecutionState:
+    """Evaluate claim eligibility and historical status against a PostgreSQL timestamp."""
+    status, failure = row["status"], row["failure_code"]
+    if status not in {"running", "retryable"}:
+        return ExecutionState(status, failure, row["exhaustion_reason"], row["retry_at"])
+
+    retry_at = row["retry_at"]
+    if status == "running":
+        cutoff = active_until(row)
+        if now < cutoff:
+            return ExecutionState(status, failure)
+        if cutoff == row["attempt_expires_at"]:
+            failure = "attempt_deadline"
+            retry_at = cutoff + retry_delay(row["attempt"])
+        elif cutoff == row["lease_expires_at"]:
+            failure = "lease_expired"
+        else:
+            failure = "execution_deadline"
+
+    if now >= row["deadline"] or (retry_at is not None and retry_at >= row["deadline"]):
+        return ExecutionState("exhausted", failure, "deadline")
+    if row["attempt"] >= row["max_attempts"]:
+        return ExecutionState("exhausted", failure, "attempt_limit")
+    return ExecutionState("retryable", failure, retry_at=retry_at)
+
+
 async def claim(connection, revision, operator, operation, inputs, seconds) -> Attempt | Unavailable:
     key = {
         "task_id": revision["task_id"], "revision": revision["revision"], "operator": operator,
@@ -111,28 +164,27 @@ async def claim(connection, revision, operator, operation, inputs, seconds) -> A
     ).on_conflict_do_nothing(constraint="uq_execution_inputs"))
     row = (await connection.execute(select(execution_runs).filter_by(**key).with_for_update())).mappings().one()
     now = await connection.scalar(select(clock))
-    if row["status"] not in {"running", "retryable"}:
-        return Unavailable(
-            row["id"], row["status"], failure_code=row["failure_code"], exhaustion_reason=row["exhaustion_reason"],
-        )
-    if row["status"] == "running" and row["lease_expires_at"] > now:
-        return Unavailable(row["id"], "running", (row["lease_expires_at"] - now).total_seconds())
-    if row["deadline"] <= now or row["attempt"] >= row["max_attempts"]:
-        reason = "deadline" if row["deadline"] <= now else "attempt_limit"
-        failure = row["failure_code"] or "lease_expired"
+    state = effective_state(row, now)
+    if state.status == "running":
+        return Unavailable(row["id"], "running", (active_until(row) - now).total_seconds())
+    if state.status == "exhausted" and row["status"] != "exhausted":
         await connection.execute(update(execution_runs).filter_by(id=row["id"]).values(
-            status="exhausted", failure_code=failure, exhaustion_reason=reason, updated_at=now,
+            status="exhausted", failure_code=state.failure_code, exhaustion_reason=state.exhaustion_reason,
+            worker_token=None, lease_expires_at=None, retry_at=None, updated_at=now,
         ))
-        return Unavailable(row["id"], "exhausted", failure_code=failure, exhaustion_reason=reason)
-    if row["retry_at"] and row["retry_at"] > now:
-        return Unavailable(row["id"], "retryable", (row["retry_at"] - now).total_seconds(), row["failure_code"])
+    if state.status != "retryable":
+        return Unavailable(
+            row["id"], state.status, failure_code=state.failure_code, exhaustion_reason=state.exhaustion_reason,
+        )
+    if state.retry_at and state.retry_at > now:
+        return Unavailable(row["id"], state.status, (state.retry_at - now).total_seconds(), state.failure_code)
 
     deadline = min(row["deadline"], now + timedelta(seconds=seconds))
     attempt = Attempt(row["id"], row["attempt"] + 1, uuid4(), monotonic() + (deadline - now).total_seconds())
     await connection.execute(update(execution_runs).filter_by(id=row["id"]).values(
         status="running", attempt=attempt.number, worker_token=attempt.token, attempt_expires_at=deadline,
         lease_expires_at=min(deadline, now + timedelta(seconds=settings.execution_lease_seconds)),
-        retry_at=None, updated_at=now,
+        retry_at=None, failure_code=state.failure_code, updated_at=now,
     ))
     return attempt
 
@@ -157,34 +209,29 @@ async def fence(connection, attempt: Attempt):
         select(execution_runs).where(*attempt.filters).with_for_update(),
     )).mappings().one_or_none()
     now = await connection.scalar(select(func.clock_timestamp()))
-    if row is None or min(row["lease_expires_at"], row["attempt_expires_at"]) <= now:
+    if row is None or active_until(row) <= now:
         raise StaleAttempt(attempt)
-    return row
+    return row, now
 
 
 async def settle(connection, attempt: Attempt, status: str, failure_code: str | None = None, *, result=None):
-    row = await fence(connection, attempt)
-    return await finish(connection, attempt, row, status, failure_code, result=result)
-
-
-async def finish(connection, attempt, row, status, failure_code, *, result=None):
-    now = await connection.scalar(select(func.clock_timestamp()))
+    row, now = await fence(connection, attempt)
     retry_at = exhaustion_reason = None
     if status == "retryable":
-        delay = settings.execution_retry_base_seconds * 2 ** (attempt.number - 1)
-        retry_at = now + timedelta(seconds=delay)
+        retry_at = now + retry_delay(attempt.number)
         if attempt.number >= row["max_attempts"]:
             exhaustion_reason = "attempt_limit"
         elif retry_at >= row["deadline"]:
             exhaustion_reason = "deadline"
         if exhaustion_reason is not None:
             status, retry_at = "exhausted", None
-    await connection.execute(update(execution_runs).where(*attempt.filters).values(
+    settled = await connection.scalar(update(execution_runs).where(*attempt.live_filters).values(
         status=status, failure_code=failure_code, exhaustion_reason=exhaustion_reason,
         result=jsonable_encoder(result), retry_at=retry_at, updated_at=now,
         worker_token=None, lease_expires_at=None,
-    ))
-    return status
+    ).returning(execution_runs.c.id))
+    if settled is None:
+        raise StaleAttempt(attempt)
 
 
 async def heartbeat(engine, attempt):
@@ -193,13 +240,10 @@ async def heartbeat(engine, attempt):
         await asyncio.sleep(interval)
         try:
             async with transaction(engine) as connection:
-                clock = func.clock_timestamp()
-                renewed = await connection.scalar(update(execution_runs).where(
-                    *attempt.filters, execution_runs.c.lease_expires_at > clock,
-                    execution_runs.c.attempt_expires_at > clock,
-                ).values(
-                    lease_expires_at=func.least(
-                        execution_runs.c.attempt_expires_at, clock + timedelta(seconds=settings.execution_lease_seconds),
+                row, now = await fence(connection, attempt)
+                renewed = await connection.scalar(update(execution_runs).where(*attempt.live_filters).values(
+                    lease_expires_at=min(
+                        row["attempt_expires_at"], row["deadline"], now + timedelta(seconds=settings.execution_lease_seconds),
                     ),
                 ).returning(execution_runs.c.id))
                 if renewed is None:
@@ -213,14 +257,11 @@ async def record_failure(engine, attempt, status, code):
     try:
         with CancelScope(shield=True):
             async with transaction(engine) as connection:
-                row = (await connection.execute(
-                    select(execution_runs).where(*attempt.filters).with_for_update(),
-                )).mappings().one_or_none()
-                if row is not None:
-                    return await finish(connection, attempt, row, status, code)
+                await settle(connection, attempt, status, code)
     except HTTPException:
-        # A superseded worker has no right to change the winning result.
-        return None
+        # Expired attempts cannot settle, even when no replacement has claimed the run yet.
+        # Claim and history evaluate abandoned leases and elapsed attempt deadlines.
+        pass
 
 
 @asynccontextmanager
@@ -264,18 +305,25 @@ async def register_object(engine, attempt: Attempt, key: str):
     async with transaction(engine) as connection:
         await fence(connection, attempt)
         await connection.execute(insert(execution_objects).values(
-            storage_key=key, execution_id=attempt.id, attempt=attempt.number,
+            storage_key=key, execution_id=attempt.id, attempt=attempt.number, write_state="pending",
         ))
 
 
-async def forget_colliding_object(engine, attempt: Attempt, key: str):
-    # An overwrite-free collision means this attempt did not create the object.
-    async with transaction(engine) as connection:
-        await connection.execute(delete(execution_objects).where(
-            execution_objects.c.storage_key == key,
-            execution_objects.c.execution_id == attempt.id,
-            execution_objects.c.attempt == attempt.number,
-        ))
+async def write_registered_object(engine, attempt: Attempt, worker, storage, key: str, data: bytes):
+    async def record_outcome(outcome):
+        # This belongs to one immutable storage reservation. It can finish after
+        # the request and does not grant authority to publish an application result.
+        async with transaction(engine) as connection:
+            await connection.execute(update(execution_objects).where(
+                execution_objects.c.storage_key == key,
+                execution_objects.c.execution_id == attempt.id,
+                execution_objects.c.attempt == attempt.number,
+                execution_objects.c.write_state == "pending",
+            ).values(write_state=outcome.state))
+
+    outcome = await worker.run(write_with_outcome, storage, key, data, write_key=key, complete=record_outcome)
+    if outcome.error is not None:
+        raise outcome.error
 
 
 def final_object_key(key: str) -> str:
@@ -287,15 +335,22 @@ def final_object_key(key: str) -> str:
     return key
 
 
-async def object_has_live_attempt(connection, key: str) -> bool:
-    clock = func.clock_timestamp()
-    current = await connection.scalar(select(execution_runs.c.id).join(
-        execution_objects, execution_objects.c.execution_id == execution_runs.c.id,
-    ).where(
-        execution_objects.c.storage_key == key,
-        execution_runs.c.attempt == execution_objects.c.attempt,
-        execution_runs.c.status == "running",
-        execution_runs.c.lease_expires_at > clock,
-        execution_runs.c.attempt_expires_at > clock,
-    ))
-    return current is not None
+async def object_may_be_discarded(connection, key: str) -> bool:
+    final_key = final_object_key(key)
+    # Serialize the ownership decision with lease renewal and publication.
+    record = (await connection.execute(select(
+        execution_objects.c.write_state, execution_objects.c.attempt.label("object_attempt"),
+        execution_runs.c.attempt, execution_runs.c.status,
+        execution_runs.c.lease_expires_at, execution_runs.c.attempt_expires_at, execution_runs.c.deadline,
+    ).join(
+        execution_runs, execution_objects.c.execution_id == execution_runs.c.id,
+    ).where(execution_objects.c.storage_key == final_key).with_for_update(of=execution_runs))).mappings().one_or_none()
+    if record is None:
+        return True
+    if record["status"] == "running" and record["attempt"] == record["object_attempt"]:
+        now = await connection.scalar(select(func.clock_timestamp()))
+        if active_until(record) > now:
+            return False
+    # A staging name is unique to the temporary file. A final name might
+    # have collided, so a reservation alone never authorizes its deletion.
+    return key != final_key or record["write_state"] == "written"

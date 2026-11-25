@@ -72,6 +72,21 @@ async def reserve_receipt(connection, key: ReceiptKey | None):
     return receipt["response"]
 
 
+async def bind_receipt_context(connection, key: ReceiptKey | None, digest: str):
+    """Bind a pending mutation to the effective inputs from its first claim."""
+    if key is None:
+        return
+    previous = await connection.scalar(
+        select(request_receipts.c.context_sha256).filter_by(**key.identity).with_for_update(),
+    )
+    if previous is None:
+        await connection.execute(
+            update(request_receipts).filter_by(**key.identity).values(context_sha256=digest),
+        )
+    elif previous != digest:
+        raise HTTPException(409, "Inputs have changed since this request was accepted")
+
+
 async def save_receipt(connection, key: ReceiptKey | None, response):
     if key is not None:
         await connection.execute(update(request_receipts).filter_by(**key.identity).values(

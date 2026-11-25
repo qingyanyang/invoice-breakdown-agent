@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI):
     app.state.extraction_limiter = CapacityLimiter(1)
     app.state.extraction_source_reader = SourceReadWorker()
     app.state.storage_worker = BlockingWorker("workbook-storage", capacity=2)
+    app.state.upload_validator = BlockingWorker("workbook-validation")
     app.state.qa_worker = BlockingWorker("workbook-qa")
     app.state.classification_limiter = CapacityLimiter(1)
     app.state.source_storage = None
@@ -68,6 +69,7 @@ async def lifespan(app: FastAPI):
     finally:
         await app.state.extraction_source_reader.close()
         await app.state.storage_worker.close()
+        await app.state.upload_validator.close()
         await app.state.qa_worker.close()
         if app.state.source_storage is not None:
             app.state.source_storage.close()

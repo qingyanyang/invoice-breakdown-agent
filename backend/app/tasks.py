@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from anyio import CancelScope, fail_after, to_thread
+from anyio import CancelScope, current_time, fail_after, to_thread
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import insert, select, update
@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.config import settings
 from app.execution import (
-    ExecutionFailure, acquire, claim, executing, fence, final_object_key, forget_colliding_object, object_has_live_attempt,
-    register_object, settle, transaction,
+    ExecutionFailure, acquire, claim, executing, fence, object_may_be_discarded,
+    register_object, settle, transaction, write_registered_object,
 )
 from app.operators import Operator
 from app.request_receipts import ReceiptKey, RequestKey, reserve_receipt, save_receipt
@@ -170,7 +170,7 @@ async def discard_unreferenced(
         referenced = await connection.scalar(
             select(task_revisions.c.task_id).where(task_revisions.c.source_key == key).limit(1)
         )
-        if referenced is not None or await object_has_live_attempt(connection, final_object_key(key)):
+        if referenced is not None or not await object_may_be_discarded(connection, key):
             return False
     await to_thread.run_sync(storage.delete, key)
     return True
@@ -239,9 +239,11 @@ async def upload_source(
 
     validate_filename(filename)
     try:
-        with fail_after(settings.execution_upload_seconds):
+        with fail_after(settings.execution_upload_seconds) as limit:
             data = await read_upload(request)
-            await to_thread.run_sync(validate_workbook, data)
+            await request.app.state.upload_validator.run(validate_workbook, data)
+            if current_time() >= limit.deadline:
+                raise TimeoutError
     except TimeoutError:
         raise HTTPException(504, "Source upload exceeded its time limit") from None
     checksum = sha256(data).hexdigest()
@@ -269,10 +271,9 @@ async def upload_source(
             await register_object(engine, attempt, key)
             storage_attempted = True
             try:
-                await request.app.state.storage_worker.run(storage.put, key, data, write_key=key)
+                await write_registered_object(engine, attempt, request.app.state.storage_worker, storage, key, data)
             except SourceAlreadyExists:
                 storage_attempted = False
-                await forget_colliding_object(engine, attempt, key)
                 raise ExecutionFailure(503, "Source storage unavailable", "storage_collision", retryable=True) from None
             except StorageError:
                 raise ExecutionFailure(503, "Source storage unavailable", "source_storage_unavailable", retryable=True) from None

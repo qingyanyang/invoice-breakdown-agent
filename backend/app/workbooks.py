@@ -19,7 +19,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.allocations import AllocationInputs, allocation_record, current_inputs
 from app.config import settings
-from app.execution import ExecutionFailure, acquire, claim, executing, fence, final_object_key, forget_colliding_object, object_has_live_attempt, register_object, settle
+from app.execution import (
+    ExecutionFailure, acquire, claim, executing, fence, object_may_be_discarded, register_object, settle,
+    write_registered_object,
+)
 from app.operators import Operator
 from app.source_storage import (
     SourceAlreadyExists, SourceIntegrityError, StorageError, StorageNotFound, read_verified_source,
@@ -134,7 +137,7 @@ async def discard_unreferenced_workbook(engine, storage, task_id: UUID, key: str
         existing = await connection.scalar(
             select(workbook_artifacts.c.artifact_id).where(workbook_artifacts.c.storage_key == key)
         )
-        if existing is not None or await object_has_live_attempt(connection, final_object_key(key)):
+        if existing is not None or not await object_may_be_discarded(connection, key):
             return False
     await to_thread.run_sync(storage.delete, key)
     return True
@@ -219,11 +222,10 @@ async def create_workbook(task_id: UUID, payload: WorkbookRequest, request: Requ
             await register_object(engine, attempt, key)
             attempted = True
             try:
-                await worker.run(storage.put, key, generated.data, write_key=key)
+                await write_registered_object(engine, attempt, worker, storage, key, generated.data)
                 await worker.run(read_verified_source, storage, key, size, checksum)
             except SourceAlreadyExists:
                 attempted = False
-                await forget_colliding_object(engine, attempt, key)
                 raise ExecutionFailure(409, "Workbook storage key already exists; retry generation", "storage_collision", retryable=True) from None
             except StorageError:
                 raise ExecutionFailure(503, "Workbook storage unavailable", "output_storage_unavailable", retryable=True) from None

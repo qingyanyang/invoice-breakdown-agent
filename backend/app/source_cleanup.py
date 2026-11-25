@@ -88,7 +88,10 @@ def main() -> None:
         parser.error(str(error))
     except (DatabaseConfigurationError, SQLAlchemyError, StorageError):
         parser.exit(1, "Cleanup could not be confirmed. Retry when the database and storage are available.\n")
-    print("Unreferenced object removed or already absent." if deleted else "Object retained because it is referenced or belongs to an active attempt.")
+    if deleted:
+        print("Unreferenced object removed or already absent.")
+    else:
+        print("Object retained because it is referenced, belongs to an active attempt, or lacks write ownership evidence.")
 
 
 if __name__ == "__main__":
