@@ -413,9 +413,11 @@ for a reference while holding the task lock. It also accepts logged local
 The generator follows `SKILL.md` §§4, 7, 9 and 10. The summary uses the
 allocation's displayed area and trade amounts, with Excel formulas for
 totals. It includes confirmed project information and the actual GST basis.
-Targeted workbooks include Adjustment Detail. No-target workbooks show the
-formula for the difference between their displayed total and the reconciled
-source amount, including any nonzero source-rounding difference.
+Targeted workbooks include Adjustment Detail with exact source amounts
+and adjustment ratios. Adjustable rows show their exact calculation.
+No-target workbooks show the formula for the difference between their
+displayed total and the reconciled source amount, including any nonzero
+source-rounding difference.
 
 Source integrity and source-sheet fidelity are checked independently.
 The input is verified by its original checksum. Copied worksheet parts

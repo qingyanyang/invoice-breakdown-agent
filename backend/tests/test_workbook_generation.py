@@ -89,6 +89,12 @@ def test_targeted_workbook_opens_and_matches_approved_display(workbook_with):
     assert Decimal(labelled(detail, "Protected Access Panel").value) == Decimal("21.01")
     residual_row = next(row for row in detail.values if row[:2] == ("Level 1", "Partition") and row[2] == -0.01)
     assert residual_row[2] == -0.01
+    partition = next(row for row in detail.values if row[0] == "Trade Summary!D4")
+    assert Decimal(partition[2]) == Decimal("110")
+    assert labelled(detail, "Adjustment factor").value == "236.53 ÷ 215.00"
+    assert partition[3] == f"{partition[2]} × (236.53 ÷ 215.00)"
+    addition = next(row for row in detail.values if row[:2] == ("Trade Summary!D13", "Access Panel"))
+    assert addition[2] == addition[3] == "1.01"
     assert formulas["Trade Summary"]["D4"].data_type == "f"
     assert values["Trade Summary"]["D12"].value == 260
     assert result.report["qa_status"] == "awaiting_qa"

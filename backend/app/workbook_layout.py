@@ -18,7 +18,7 @@ from app.workbook_source import MAIN, S, XML_SPACE, WorkbookProblem, parse, seri
 SUMMARY = "Invoice Breakdown"
 ADJUSTMENT = "Adjustment Detail"
 EVIDENCE = "Source Evidence"
-TEMPLATE_VERSION = "2"
+TEMPLATE_VERSION = "3"
 EVIDENCE_LINES_PER_ROW = 24
 MONEY = "$#,##0.00"
 DATE = "dd/mm/yyyy"
@@ -290,7 +290,7 @@ def exact_text(amount) -> str:
 
 
 def adjustment_sheet(styles, report, reconciliation, summary_total_row):
-    sheet = Worksheet(ADJUSTMENT, styles, (35, 25, 20, 20, 20, 44))
+    sheet = Worksheet(ADJUSTMENT, styles, (35, 25, 20, 34, 20, 44))
     sheet.row(Cell(ADJUSTMENT, "title"))
     sheet.row("Generated for review · Awaiting QA")
     for label, key in (
@@ -345,10 +345,14 @@ def adjustment_sheet(styles, report, reconciliation, summary_total_row):
             sheet.row(item["area"], item["trade"], money_cell(item["amount"]))
 
     sheet.row()
-    sheet.row(*(Cell(value, "heading") for value in ("Source row", "Trade", "Original exact", "Adjusted unrounded", "Scope", "Rule")))
+    sheet.row(*(Cell(value, "heading") for value in ("Source row", "Trade", "Original exact", "Adjusted exact", "Scope", "Rule")))
     for item in report["assignments"]:
+        adjusted = item["unrounded_amount"]
+        if factor and item["protection"] is None:
+            # Express recurring amounts exactly without expanding them across hundreds of digits.
+            adjusted = f"{item['source_amount']} × ({factor_text})"
         sheet.row(
-            item["row"], item["trade"], item["source_amount"], item["unrounded_amount"],
+            item["row"], item["trade"], item["source_amount"], adjusted,
             item["scope_origin"], item["protection"] or "Uniform factor",
         )
     return sheet
