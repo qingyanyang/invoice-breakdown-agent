@@ -437,6 +437,54 @@ API identifies the sheet and feature. The workbook is marked
 `generated_awaiting_qa`. Recalculation, visual certification and final
 customer delivery authorization belong to Issue #11.
 
+## Verify and release a workbook
+
+Run `alembic upgrade head` before starting the service. Configure a trusted
+local Docker runtime and build the workbook QA image on that host.
+
+```bash
+docker build -t invoice-breakdown-qa:local backend/qa_worker
+```
+
+Set `QA_WORKER_IMAGE=invoice-breakdown-qa:local` and optionally provide
+the Docker executable as `QA_DOCKER_RUNTIME`. QA needs access to that
+local runtime. Each job runs without network or host mounts, with a
+read-only root, an unprivileged user, and limits on elapsed time,
+temporary storage, memory, CPU, and processes. The worker uses a fresh
+LibreOffice profile with macro execution disabled for the untrusted
+workbook. The API rejects live external relationships before calling it.
+An unavailable or timed-out tool records an unperformed check.
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /tasks/{id}/delivery/qa` | Send `expected_revision` and `expected_artifact_id` from the current `/workbook` response. Runs or resumes QA for those exact inputs. |
+| `GET /tasks/{id}/delivery/qa` | Read the recorded outcomes, evidence, sheet ranges, and candidate and preview checksums. |
+| `GET /tasks/{id}/delivery/qa/preview` | Download the candidate's PDF proof. The QA report maps each page to its worksheet and populated range. |
+| `POST /tasks/{id}/delivery/qa/visual-review` | Submit `expected_revision`, `expected_artifact_id`, `expected_qa_id`, `candidate_sha256`, `preview_sha256`, and one sheet result per preview. |
+| `GET /tasks/{id}/delivery/download` | Download the exact approved candidate after all required checks pass. The ready QA response includes a Chinese delivery summary and this link. |
+
+A sheet result has a `sheet` name and `outcome` of `passed` or `failed`.
+Check layout, clipping, text, dates, and number formats before marking each
+sheet passed. Include a `note` for failures. The review is bound to both
+checksums and the current run. The owner can still download Issue #10's
+`generated_awaiting_qa` review workbook from `/workbook/download`.
+
+QA clears formula caches on a disposable copy to obtain fresh results.
+It imports only results for matching formula coordinates and expressions
+into the original workbook package. It then removes the review banner
+from the candidate, verifies that all other worksheet content and layout
+still match, and replays scope and allocation against candidate amounts.
+Actual error cells or a nonzero displayed difference block release.
+The versioned candidate is stored separately and checked before release.
+
+The PDF is rendered from the candidate with hidden sheet, row, and column
+content exposed for inspection on a disposable preview copy. Each page
+must cover its recorded worksheet and match the expected visible content.
+Unsupported formats, missing coverage, and clipped content prevent approval.
+When rendering is temporarily unavailable, a retry resumes from the saved
+candidate. A replacement workbook or candidate requires new evidence and
+owner approval.
+
 ## Tests
 
 From `backend/` with the virtual environment active:

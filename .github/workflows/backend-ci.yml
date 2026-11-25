@@ -36,9 +36,12 @@ jobs:
       - uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.12"
+      - name: Build isolated workbook QA worker
+        run: docker build -t invoice-breakdown-qa:ci backend/qa_worker
       - name: Run backend tests against disposable PostgreSQL
         working-directory: backend
         env:
+          TEST_QA_WORKER_IMAGE: invoice-breakdown-qa:ci
           TEST_POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
           TEST_DATABASE_URL: postgresql+psycopg://fixture_user:fixture_password@127.0.0.1:5432/invoice_breakdown_test
         run: |

@@ -17,7 +17,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from app.allocations import allocation_record, current_inputs
+from app.allocations import AllocationInputs, allocation_record, current_inputs
 from app.operators import Operator
 from app.source_storage import (
     SourceAlreadyExists, SourceIntegrityError, StorageError, StorageNotFound, read_verified_source,
@@ -63,6 +63,8 @@ class CurrentWorkbookInputs:
     extraction: dict
     reconciliation: dict
     allocation: dict
+    approved: AllocationInputs
+    policy: dict
 
     @property
     def identity(self) -> dict:
@@ -82,6 +84,7 @@ async def workbook_inputs(connection: AsyncConnection, revision, expected: UUID 
         raise HTTPException(409, "The approved allocation has changed")
     return CurrentWorkbookInputs(
         dict(revision), record["allocation_id"], inputs.extraction.result, inputs.reconciliation.report, record["report"],
+        inputs, record["policy"],
     )
 
 
