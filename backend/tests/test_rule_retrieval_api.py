@@ -1,6 +1,9 @@
 import hashlib
+import json
 
+import httpx
 import pytest
+from pydantic import SecretStr
 
 from app import classification_model, main, rule_retrieval
 from app.checkpoints import setup_checkpoints
@@ -65,10 +68,51 @@ async def test_classification_records_rule_matches_without_importing_historical_
         assert match["version"] == "synthetic-v1"
         assert match["text"] == "FF&E maps to Doors."
         assert match["row_refs"] == ["Trade Summary!D4"]
-        assert historical in seen[0].text
+        assert historical not in seen[0].text
         assert len(seen[0].retrieved_rules) == 1
         assert success(await client.get(path, headers=ALICE)) == result
         assert (await client.get(f"/tasks/{task_id}/rules", headers=BOB)).status_code == 404
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("amount", ["150.00", "98765.43"])
+async def test_provider_cannot_publish_historical_amounts_in_project_rationale(
+    task_runtime, configured_skill, monkeypatch, workbook_with, amount,
+):
+    historical = "Historical example from another project: FF&E cost $98,765.43."
+    configured_skill.write_text(configured_skill.read_text() + "\n" + historical + "\n")
+    active_rules(monkeypatch, configured_skill)
+    client_class = httpx.AsyncClient
+    submit_unsupported_reason = True
+
+    def respond(request):
+        messages = json.loads(request.content)["messages"]
+        assert historical not in messages[0]["content"] and "98,765.43" not in messages[0]["content"]
+        inputs = json.loads(messages[1]["content"])
+        proposal = model_answer(inputs, {row["row"]: "Doors" for row in inputs["rows"]}).model_dump()
+        if submit_unsupported_reason:
+            proposal["rows"][0]["reason"] = "This project's FF&E cost was $98,765.43."
+        return httpx.Response(200, json={"choices": [{
+            "finish_reason": "stop", "message": {"content": json.dumps(proposal)},
+        }]})
+
+    monkeypatch.setattr(settings, "llm_api_key", SecretStr("example-key"))
+    monkeypatch.setattr(classification_model.httpx, "AsyncClient", lambda **kwargs: client_class(
+        transport=httpx.MockTransport(respond), **kwargs,
+    ))
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, doors_source(workbook_with, amount))
+        path = f"/tasks/{task_id}/classification"
+        assert (await client.post(path, headers=ALICE, json=START)).status_code == 503
+        failed = success(await client.get(path, headers=ALICE))
+        assert failed["report"]["error"] == "invalid_model_proposal"
+        assert "98,765.43" not in json.dumps(failed) and failed["report"]["assignments"] == []
+        submit_unsupported_reason = False
+        classified = success(await client.post(path, headers=ALICE, json=START))
+        assert classified["status"] == "ready_for_allocation" and classified["report"]["classified_total"] == amount
+        review, = classified["report"]["model_proposals"]
+        assert review["reason"] == "The model proposed Doors from Trade Summary!A4: FF&E door hardware"
 
 
 @pytest.mark.anyio
@@ -240,6 +284,85 @@ async def test_optional_search_failure_uses_full_verified_primary_without_mismat
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("recovery", ["archive", "explicit_primary_only"])
+async def test_pinned_supplement_blocks_classification_until_restored_or_explicitly_removed(
+    task_runtime, configured_skill, monkeypatch, tmp_path, workbook_with, recovery,
+):
+    primary = active_rules(monkeypatch, configured_skill)
+    codex = write_codex(tmp_path, monkeypatch)
+    original = codex.read_bytes()
+    digest = hashlib.sha256(original).hexdigest()
+    archive = tmp_path / "approved-rules"
+    monkeypatch.setattr(settings, "classification_codex_path", codex)
+    monkeypatch.setattr(settings, "classification_rules_archive", archive)
+    calls = []
+
+    async def model(config, specification, inputs):
+        calls.append(specification.supplementary)
+        return await doors_model(config, specification, inputs)
+
+    monkeypatch.setattr(classification_model, "propose", model)
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, doors_source(workbook_with))
+        path = f"/tasks/{task_id}"
+        before = success(await client.post(path + "/classification", headers=ALICE, json=START))
+        assert before["report"]["rule_context"]["supplementary"]["sha256"] == digest
+        success(await client.put(path + "/target", headers=ALICE, json={
+            **START, "target": {"amount": "160.00", "gst_basis": "excluding_gst"},
+        }))
+        codex.unlink()
+
+    async with service() as client:
+        revision_three = {"expected_revision": 3}
+        assert success(await client.get(path + "/rules", headers=ALICE))["supplementary"]["sha256"] == digest
+        for stage in ("workflow", "extraction", "reconciliation"):
+            success(await client.post(path + "/" + stage, headers=ALICE, json=revision_three))
+        missing = await client.post(path + "/classification", headers=ALICE, json=revision_three)
+        assert missing.status_code == 503 and missing.json()["detail"]["code"] == "pinned_supplementary_unavailable"
+        failed = success(await client.get(path + "/classification", headers=ALICE))
+        assert failed["status"] == "failed"
+        context = failed["report"]["rule_context"]
+        assert context["primary_verified"] and context["supplementary"] is None
+        assert context["pinned_supplementary"]["sha256"] == digest
+        assert len(calls) == 1
+        upgrade = {**revision_three, "primary_sha256": primary}
+        assert (await client.post(path + "/rules/upgrade", headers=ALICE, json=upgrade)).status_code == 409
+
+        if recovery == "archive":
+            codex.write_text("Changed default version, with no archived copy yet.", encoding="utf-8")
+            stale = await client.post(path + "/classification", headers=ALICE, json=revision_three)
+            assert stale.status_code == 503 and stale.json()["detail"]["code"] == "pinned_supplementary_mismatch"
+            assert len(calls) == 1
+            archived = archive / digest / codex.name
+            archived.parent.mkdir(parents=True)
+            archived.write_bytes(original)
+            # The new default registry entry does not authorize a substitution for this task.
+            monkeypatch.setattr(classification_model, "APPROVED_CODEX_VERSION", "new-default-version")
+            monkeypatch.setattr(classification_model, "APPROVED_CODEX_SHA256", hashlib.sha256(codex.read_bytes()).hexdigest())
+            restored = success(await client.post(path + "/classification", headers=ALICE, json=revision_three))
+            assert restored["status"] == "ready_for_allocation"
+            assert restored["report"]["rule_context"]["supplementary"] == before["report"]["rule_context"]["supplementary"]
+            assert calls[0] == calls[1]
+        else:
+            change = {**upgrade, "supplementary_sha256": None}
+            assert (await client.post(path + "/rules/upgrade", headers=BOB, json=change)).status_code == 404
+            key = ALICE | {"Idempotency-Key": "explicit-primary-only"}
+            changed = success(await client.post(path + "/rules/upgrade", headers=key, json=change))
+            assert changed["task"]["revision"] == 4 and changed["rules"]["supplementary"] is None
+            assert success(await client.post(path + "/rules/upgrade", headers=key, json=change)) == changed
+            assert (await client.post(path + "/rules/upgrade", headers=key, json=upgrade)).status_code == 409
+            assert success(await client.get(path + "/rules?revision=3", headers=ALICE))["supplementary"]["sha256"] == digest
+            codex.write_bytes(original)
+            revision_four = {"expected_revision": 4}
+            for stage in ("workflow", "extraction", "reconciliation"):
+                success(await client.post(path + "/" + stage, headers=ALICE, json=revision_four))
+            restored = success(await client.post(path + "/classification", headers=ALICE, json=revision_four))
+            assert restored["status"] == "ready_for_allocation"
+            assert len(calls) == 2 and calls[1].text is None
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("change", ["retrieval", "supplementary"])
 async def test_classification_execution_fingerprint_includes_rule_configuration(
     task_runtime, configured_skill, monkeypatch, tmp_path, workbook_with, change,
@@ -268,13 +391,16 @@ async def test_classification_execution_fingerprint_includes_rule_configuration(
         second = await client.post(path, headers=ALICE, json=START)
         assert second.status_code == 503
         assert first.headers["X-Execution-Id"] != second.headers["X-Execution-Id"]
-        assert len(calls) == 2 and calls[0]["status"] == "applied"
+        assert calls[0]["status"] == "applied"
         context = success(await client.get(path, headers=ALICE))["report"]["rule_context"]
         if change == "retrieval":
+            assert len(calls) == 2
             assert context["retrieval_configuration"] == "keyword-test-v2"
             assert context["supplementary"]["sha256"] == calls[0]["sha256"]
         else:
-            assert context["supplementary"] is None and calls[1]["status"] == "not_configured"
+            assert len(calls) == 1 and second.json()["detail"]["code"] == "pinned_supplementary_unavailable"
+            assert context["supplementary"] is None
+            assert context["pinned_supplementary"]["sha256"] == calls[0]["sha256"]
 
 
 @pytest.mark.anyio

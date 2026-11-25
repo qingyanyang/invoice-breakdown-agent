@@ -24,13 +24,18 @@ from app.operators import Operator
 from app.reconciliations import ReconciliationDetails, reconciliation_record, require_extraction
 from app.reconciliation_evidence import Reference
 from app.request_receipts import ReceiptKey, RequestKey, save_receipt
-from app.task_rules import applied_supplementary, load_verified_rules, primary_document, rule_pin, save_pin
+from app.task_rules import (
+    PINNED_SUPPLEMENT_ERRORS, RULE_INPUT_ERRORS, applied_supplementary, load_verified_rules, primary_document,
+    rule_pin, save_pin,
+)
 from app.tasks import database_for, lock_current_revision, owned_revision, reserve_owned_receipt, transaction
 from app.workflows import RevisionRequest
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tasks/{task_id}/classification", tags=["classification"])
-TRANSIENT_CLASSIFICATION_ERRORS = {"model_unavailable", "invalid_model_proposal", "primary_specification_unavailable"}
+TRANSIENT_CLASSIFICATION_ERRORS = {
+    "model_unavailable", "invalid_model_proposal", "primary_specification_unavailable", "pinned_supplementary_unavailable",
+}
 
 
 class ClassificationAnswer(RevisionRequest):
@@ -135,9 +140,12 @@ async def run_classification(
     )
     primary = verified.pin.primary if verified else expected_primary
     supplement = applied_supplementary(verified.specification) if verified else None
+    pin = verified.pin if verified else original_pin
     rule_identity = {
         "primary": asdict(primary), "supplementary": asdict(supplement) if supplement else None,
+        "pinned_supplementary": asdict(pin.supplementary) if pin and pin.supplementary else None,
         "retrieval_configuration": rule_retrieval.RETRIEVAL_VERSION,
+        "model_contract": classification_model.MODEL_CONTRACT_VERSION,
     }
 
     async def prepare(connection):
@@ -200,7 +208,13 @@ async def run_classification(
             proposal = None
         if supplementary is not None:
             report["supplementary_rules"] = supplementary
-        report["rule_context"] = {**rule_identity, "retrieval": retrieval.report(), "primary_verified": verified is not None}
+        primary_verified = verified is not None or (
+            rules_error is not None and rules_error.code in PINNED_SUPPLEMENT_ERRORS
+        )
+        report["rule_context"] = {
+            **rule_identity, "retrieval": retrieval.report(),
+            "primary_verified": primary_verified,
+        }
 
         async with transaction(engine) as connection:
             revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
@@ -234,8 +248,12 @@ async def run_classification(
 def classification_response(result, headers=None):
     if result.status == "failed":
         error = result.report["error"]
-        if error in {"primary_specification_unavailable", "primary_specification_mismatch"}:
-            raise HTTPException(503, {"code": error, "message": "Approved primary rules are unavailable"}, headers=headers)
+        if error in RULE_INPUT_ERRORS:
+            message = (
+                "The pinned supplementary rules are unavailable" if error in PINNED_SUPPLEMENT_ERRORS
+                else "Approved primary rules are unavailable"
+            )
+            raise HTTPException(503, {"code": error, "message": message}, headers=headers)
         raise HTTPException(503, "Classification unavailable. Read the recorded outcome for details.", headers=headers)
     return result
 
@@ -309,7 +327,7 @@ async def answer_classification(
     if attempt is None:
         return inputs
     extraction, reconciliation, prior, decisions = inputs
-    proposal = Proposal.model_validate(prior["proposal"])
+    proposal = Proposal.from_storage(prior["proposal"])
     provenance = {
         name: prior["report"][name] for name in ("supplementary_rules", "rule_context") if name in prior["report"]
     }

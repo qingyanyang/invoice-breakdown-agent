@@ -24,6 +24,8 @@ from app.tasks import (
 from app.workflows import RevisionRequest
 
 router = APIRouter(prefix="/tasks/{task_id}/rules", tags=["approved rules"])
+PINNED_SUPPLEMENT_ERRORS = {"pinned_supplementary_unavailable", "pinned_supplementary_mismatch"}
+RULE_INPUT_ERRORS = PINNED_SUPPLEMENT_ERRORS | {"primary_specification_mismatch", "primary_specification_unavailable"}
 
 
 @dataclass(frozen=True)
@@ -52,31 +54,48 @@ def applied_supplementary(specification) -> RuleDocument | None:
     return RuleDocument("Invoice.Breakdown.Codex.md", facts["version"], facts["sha256"])
 
 
+def archived_rule(config: Settings, document: RuleDocument) -> Path | None:
+    if config.classification_rules_archive and re.fullmatch(r"[0-9a-f]{64}", document.sha256):
+        return config.classification_rules_archive / document.sha256 / document.document
+    return None
+
+
+def read_pinned_supplement(config: Settings, document: RuleDocument) -> classification_model.SupplementarySpecification:
+    mismatch = False
+    for path in (config.classification_codex_path, archived_rule(config, document)):
+        supplement = classification_model.read_supplementary_specification(
+            path, version=document.version, sha256=document.sha256,
+        )
+        if supplement.status == "applied":
+            return supplement
+        mismatch |= supplement.status == "checksum_mismatch"
+    code = "pinned_supplementary_mismatch" if mismatch else "pinned_supplementary_unavailable"
+    raise classification_model.ClassificationModelError(code)
+
+
 def read_verified_rules(config: Settings, pin: RulePin | None) -> VerifiedRules:
     expected = pin.primary if pin else primary_document(config.classification_skill_sha256, config.classification_skill_version)
-    paths = [config.classification_skill_path]
-    if pin and config.classification_rules_archive and re.fullmatch(r"[0-9a-f]{64}", expected.sha256):
-        paths.append(Path(config.classification_rules_archive) / expected.sha256 / expected.document)
     mismatch = False
-    for path in paths:
+    for path in (config.classification_skill_path, archived_rule(config, expected) if pin else None):
+        if path is None:
+            continue
         try:
-            specification = classification_model.read_primary_specification(path, config.classification_codex_path)
+            specification = classification_model.read_primary_specification(path)
         except classification_model.ClassificationModelError:
             continue
         if specification.sha256 != expected.sha256:
             mismatch = True
             continue
 
-        supplementary = applied_supplementary(specification)
         if pin is None:
-            selected = RulePin(expected, supplementary)
+            supplement = classification_model.read_supplementary_specification(config.classification_codex_path)
+        elif pin.supplementary:
+            supplement = read_pinned_supplement(config, pin.supplementary)
         else:
-            selected = pin
-            if supplementary is not None and supplementary != pin.supplementary:
-                specification = replace(
-                    specification, supplementary=classification_model.SupplementarySpecification("version_not_pinned"),
-                )
-        return VerifiedRules(selected, specification)
+            status = "version_not_pinned" if config.classification_codex_path else "not_configured"
+            supplement = classification_model.SupplementarySpecification(status)
+        specification = replace(specification, supplementary=supplement)
+        return VerifiedRules(pin or RulePin(expected, applied_supplementary(specification)), specification)
 
     code = "primary_specification_mismatch" if mismatch else "primary_specification_unavailable"
     raise classification_model.ClassificationModelError(code)
@@ -147,6 +166,7 @@ async def save_pin(connection, task_id: UUID, revision: int, pin: RulePin):
 
 class RuleUpgrade(RevisionRequest):
     primary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    supplementary_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class UpgradeReceipt(BaseModel):
@@ -169,7 +189,9 @@ async def upgrade_rules(
     task_id: UUID, payload: RuleUpgrade, request: Request, operator: Operator, idempotency_key: RequestKey = None,
 ) -> UpgradeReceipt:
     engine = database_for(request)
-    key = ReceiptKey.from_request(operator, "rule_upgrade", idempotency_key, [task_id, payload])
+    # Omission preserves the rule set. An explicit null opts into primary-only use.
+    key = ReceiptKey.from_request(operator, "rule_upgrade", idempotency_key, [task_id, payload.model_dump(exclude_unset=True)])
+    declares_supplement = "supplementary_sha256" in payload.model_fields_set
     async with transaction(engine) as connection:
         if (receipt := await reserve_owned_receipt(connection, task_id, key)) is not None:
             return UpgradeReceipt.model_validate(receipt)
@@ -182,6 +204,13 @@ async def upgrade_rules(
     except classification_model.ClassificationModelError as error:
         raise HTTPException(503, {"code": error.code, "message": "Approved primary rules are unavailable"}) from None
 
+    selected = verified.pin
+    if declares_supplement:
+        if payload.supplementary_sha256 is None:
+            selected = RulePin(selected.primary)
+        elif not selected.supplementary or payload.supplementary_sha256 != selected.supplementary.sha256:
+            raise HTTPException(409, "Select the configured and verified supplementary rules checksum")
+
     async with transaction(engine) as connection:
         if (receipt := await reserve_owned_receipt(connection, task_id, key)) is not None:
             return UpgradeReceipt.model_validate(receipt)
@@ -191,9 +220,13 @@ async def upgrade_rules(
         try:
             previous = await rule_pin(connection, current)
         except ConflictingRuleHistory:
+            if not declares_supplement:
+                raise HTTPException(409, "Explicitly select the supplementary rules checksum or null") from None
             previous = None
-        if previous == verified.pin:
+        if previous and not declares_supplement:
+            selected = RulePin(selected.primary, previous.supplementary)
+        if previous == selected:
             raise HTTPException(409, "This task already uses the selected rules")
         updated = await append_revision(connection, current, {})
-        await save_pin(connection, task_id, updated.revision, verified.pin)
-        return await save_receipt(connection, key, UpgradeReceipt(task=updated, rules=verified.pin))
+        await save_pin(connection, task_id, updated.revision, selected)
+        return await save_receipt(connection, key, UpgradeReceipt(task=updated, rules=selected))

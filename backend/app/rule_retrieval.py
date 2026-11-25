@@ -4,9 +4,10 @@ import re
 import unicodedata
 from dataclasses import asdict, dataclass
 
+from app.classification_evidence import COMBINED_FLOORS
 from app.request_receipts import fingerprint
 
-RETRIEVAL_VERSION = "keyword-v1"
+RETRIEVAL_VERSION = "keyword-v2"
 MAX_MATCHES = 6
 MAX_PASSAGE_LENGTH = 640
 MAX_ROW_REFERENCES = 12
@@ -18,10 +19,6 @@ HISTORY = re.compile(
     r"\b(?:historical|example|unrelated|sample|past project|previous project|prior project|earlier project)\b", re.IGNORECASE,
 )
 ILLUSTRATIVE_VALUE = re.compile(r"[$€£¥]|\b\d")
-COMBINED_AREA = re.compile(
-    r"\b(?:levels?|floors?)\s+[\w-]+\s+(?:and|to|&)\s+(?:(?:level|floor)\s+[\w-]+|\d{1,4}[A-Za-z]?)\b",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -160,7 +157,10 @@ def search_rules(text: str, source_sha256: str, approved: RuleDocument, inputs: 
             cue = " ".join((row["description"][:MAX_QUERY_CHARS], *areas))[:MAX_QUERY_CHARS]
             query = " " + tokens(cue) + " "
             weight = max((strength for term, strength in terms if term in query), default=0)
-            if topic.name == "combined_area" and COMBINED_AREA.search(cue):
+            if topic.name == "combined_area" and (
+                any(COMBINED_FLOORS.fullmatch(area[:MAX_QUERY_CHARS]) for area in areas)
+                or COMBINED_FLOORS.search(row["description"][:MAX_QUERY_CHARS])
+            ):
                 weight = max(weight, 2)
             if weight:
                 score = max(score, weight)

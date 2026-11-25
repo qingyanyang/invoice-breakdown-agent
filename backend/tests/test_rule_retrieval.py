@@ -36,6 +36,7 @@ DOCUMENT = RuleDocument("SKILL.md", "synthetic-approved-v1", DIGEST)
     ("Standard Access Panel in suspended ceiling", {}, "6", "Classify Access Panel separately from Ceiling"),
     ("Partitions with glazing frames", {}, "6", "Separate glass, glazing frames, and mullions"),
     ("Floor fit-off", {"Level 1 and Level 2": ["Trades!B4"]}, "7", "Do not invent floor allocations"),
+    ("Floor fit-off", {"Level 1 / Level 2": ["Trades!B4"]}, "7", "Do not invent floor allocations"),
     ("Deletion of alternate partition", {}, "5", "Determine whether Option, Removal, and Deletion"),
     ("Temporary fencing", {}, "6", "Use Other only for items"),
     ("Level 1 and patching existing wall", {}, "6", "Classify genuine repair and patching"),

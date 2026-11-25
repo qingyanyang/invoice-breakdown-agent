@@ -21,7 +21,6 @@ def model_answer(inputs, by_row):
         {
             "row": row["row"], "trade": by_row.get(row["row"], "Other"),
             "trade_evidence": [row["description_reference"]],
-            "reason": "The specific workbook description supports this trade.",
             "area": None, "glazing_price": None,
         }
         for row in inputs["rows"]
