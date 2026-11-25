@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -185,7 +186,7 @@ async def test_delivery_of_exact_candidate_requires_all_owner_checks_and_expires
         qa = success(await client.post(qa_path, headers=ALICE, json=payload))
         assert calls == ["calculate", "render", "render"]
         assert qa["candidate"] == paused["candidate"]
-        assert qa["status"] == "awaiting_visual_review", qa["checks"]
+        assert qa["status"] == "awaiting_visual_review", json.dumps(qa["checks"], ensure_ascii=False)
         assert all(qa["checks"][name]["status"] == "passed" for name in MACHINE_CHECKS)
         assert qa["checks"]["owner_visual_review"]["status"] == "not_performed"
         assert qa["candidate"]["sha256"] != artifact["sha256"]
