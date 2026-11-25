@@ -1,25 +1,21 @@
 """Check the recalculated candidate and measure coverage of its visual proof."""
 
-import re
-import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from decimal import Decimal, DecimalException, ROUND_HALF_UP, localcontext
+from decimal import Decimal, DecimalException, localcontext
 from io import BytesIO
 from zipfile import BadZipFile, ZipFile
 
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
 
 from app.allocation import ALLOCATION_CONTEXT, AllocationPolicy, allocate
 from app.reconcile import cents, reconcile
-from app.reconciliation_evidence import Reference
+from app.reconciliation_evidence import Reference, numeric
 from app.workbook_layout import ADJUSTMENT, EVIDENCE, SUMMARY, adjustment_sheet, metadata, summary_sheet
 from app.workbook_source import S, SourcePackage, WorkbookProblem, parse
 from app.qa_engine import EngineUnavailable
+from app.qa_preview import measure_copy, preview_witnesses, verify_preview
 from app.qa_packages import (
-    QAProblem, QABook, candidate_from_calculation, location, populated_range, render_copy, strip_formula_caches,
+    QAProblem, QABook, candidate_from_calculation, location, render_copy, strip_formula_caches,
 )
 
 CHECKS = (
@@ -27,14 +23,7 @@ CHECKS = (
     "financial_reconciliation", "preview_coverage", "owner_visual_review",
 )
 MACHINE_CHECKS = CHECKS[:-1]
-QA_VERSION = "1"
-MAX_PAGE_POINTS = 14_400
-MONEY_FORMAT = re.compile(r"(?P<symbol>\$)?(?P<int>[#0,]+)(?:\.(?P<decimals>0+))?(?P<percent>%)?")
-DATE_FORMATS = {
-    "dd/mm/yyyy": "%d/%m/%Y", "d/m/yyyy": "%-d/%-m/%Y", "mm/dd/yyyy": "%m/%d/%Y",
-    "yyyy-mm-dd": "%Y-%m-%d", "mm-dd-yy": "%m-%d-%y", "dd-mmm-yy": "%d-%b-%y",
-    "d-mmm-yy": "%-d-%b-%y",
-}
+QA_VERSION = "2"
 
 
 @dataclass(frozen=True)
@@ -43,6 +32,7 @@ class QAResult:
     candidate: bytes | None = None
     preview: bytes | None = None
     coverage: list[dict] | None = None
+    engine_changed: bool = False
 
 
 def outcome(status: str, detail: str, *, locations=None, evidence=None):
@@ -96,6 +86,22 @@ def template_values(sheet):
             value = Decimal(value)
         wanted[ref] = (node.findtext(S + "f"), value)
     return wanted
+
+
+def traced_source_amounts(recon: dict) -> dict[Reference, Decimal]:
+    # Use each cell's own sign. Parent coefficients apply only when rolling up a subtotal.
+    amounts = {
+        Reference.from_dict(item["reference"]): Decimal(item["source_amount"])
+        for item in (*recon["selected_rows"], *recon["scope_additions"])
+    }
+    # Reconciliation records groups before descending into their children.
+    for group in reversed(recon["hierarchy"]):
+        amounts[Reference.from_dict(group["reference"])] = sum(
+            child["coefficient"] * amounts[Reference.from_dict(child["reference"])]
+            for child in group["children"]
+        )
+    amounts[Reference.from_dict(recon["control"]["reference"])] = Decimal(recon["independently_calculated_total"])
+    return amounts
 
 
 def finance_check(inputs, book: QABook, mapping: dict):
@@ -153,16 +159,13 @@ def finance_check(inputs, book: QABook, mapping: dict):
                 elif (actual["text"] or "") != value:
                     differences.append(location(expected.name, ref))
 
-        # Verify the approval's source control against the recalculated copied sheet.
-        source_control = Reference.from_dict(recon["control"]["reference"])
-        copied = mapping[source_control.sheet]
-        observed = book.sheets[copied].cells.get(source_control.cell, {})
-        try:
-            raw = Decimal(observed.get("raw_value") or "NaN")
-        except DecimalException:
-            raw = Decimal("NaN")
-        if not raw.is_finite() or cents(raw) != cents(Decimal(recon["reported_total"])):
-            differences.append(location(copied, source_control.cell))
+        source_amounts = traced_source_amounts(recon)
+        for ref, expected in source_amounts.items():
+            copied = mapping.get(ref.sheet, ref.sheet)
+            sheet = book.sheets.get(copied)
+            observed = numeric(sheet.cells.get(ref.cell)) if sheet and ref.sheet in mapping else None
+            if observed is None or cents(observed) != cents(expected):
+                differences.append(location(copied, ref.cell))
         if differences:
             raise QAProblem("Candidate amounts, labels or formulas differ from the approved workbook evidence.", differences[:200])
 
@@ -170,100 +173,8 @@ def finance_check(inputs, book: QABook, mapping: dict):
         "source_control": recon["reported_total"], "working_total": replay["working_total"],
         "target": replay["target"], "displayed_total": replay["display"]["total"], "difference": "0.00",
         "summary_total_cell": f"B{total_row}", "protected_total": replay["protected_total"],
+        "verified_source_amount_cells": len(source_amounts),
     }
-
-
-def text_key(value: str) -> str:
-    return "".join(char for char in unicodedata.normalize("NFKC", value) if not char.isspace())
-
-
-def displayed_text(cell: dict, date_1904: bool) -> str | None:
-    if cell["text"] is not None:
-        return cell["text"]
-    raw = cell["raw_value"]
-    if raw in {None, ""}:
-        return ""
-    if cell["cell_type"] == "b":
-        return "TRUE" if raw == "1" else "FALSE" if raw == "0" else None
-    if cell["cell_type"] == "e":
-        return raw
-    code = cell["number_format"]["code"]
-    if code is None or cell["cell_type"] not in {"d", "n"}:
-        return None
-    try:
-        if pattern := DATE_FORMATS.get(code.lower()):
-            if cell["cell_type"] == "d":
-                value = datetime.fromisoformat(raw).date()
-            else:
-                days = int(Decimal(raw))
-                epoch = date(1904, 1, 1) if date_1904 else date(1899, 12, 31)
-                if not date_1904 and days == 60:
-                    return None
-                value = epoch + timedelta(days=days - (not date_1904 and days > 60))
-            return value.strftime(pattern)
-        if cell["cell_type"] == "d":
-            return None
-        value = Decimal(raw)
-        if not value.is_finite():
-            return None
-        if code.lower() == "general":
-            if abs(value) >= Decimal("1e11") or (value and abs(value) < Decimal("1e-9")):
-                return None
-            # Calc's XLSX numeric cache may contain binary round-trip noise.
-            with localcontext() as context:
-                context.prec = 15
-                return format((+value).normalize(), "f") if value else "0"
-        match = MONEY_FORMAT.fullmatch(code)
-        if match is None:
-            return None
-        precision = len(match["decimals"] or "")
-        percent = match["percent"] or ""
-        symbol = match["symbol"] or ""
-        value = (value * (100 if percent else 1)).quantize(Decimal(1).scaleb(-precision), rounding=ROUND_HALF_UP)
-        number = format(value.copy_abs(), f"{',' if ',' in match['int'] else ''}.{precision}f")
-        return ("-" if value < 0 else "") + symbol + number + percent
-    except (ValueError, OverflowError, DecimalException):
-        return None
-
-
-def verify_preview(book: QABook, pdf: bytes) -> list[dict]:
-    try:
-        pages = PdfReader(BytesIO(pdf), strict=True).pages
-        if len(pages) != len(book.sheets):
-            raise QAProblem("Preview page count does not cover every worksheet.")
-        report, incomplete, unknown = [], [], []
-        for page_no, (sheet, page) in enumerate(zip(book.sheets.values(), pages), 1):
-            if not (0 < float(page.mediabox.width) <= MAX_PAGE_POINTS and 0 < float(page.mediabox.height) <= MAX_PAGE_POINTS):
-                raise QAProblem("The rendered worksheet exceeds the reviewable page dimensions.", [{"sheet": sheet.name}])
-            text = text_key(page.extract_text() or "")
-            witnesses = []
-            for ref, cell in sheet.cells.items():
-                shown = displayed_text(cell, book.date_1904)
-                if shown is None:
-                    unknown.append(location(sheet.name, ref))
-                elif shown.strip():
-                    witnesses.append((ref, text_key(shown)))
-            # Match longer strings first and consume each occurrence so duplicate
-            # values cannot hide an omitted cell. Soft wrapping does not affect the match.
-            for ref, value in sorted(witnesses, key=lambda item: -len(item[1])):
-                index = text.find(value)
-                if index < 0:
-                    incomplete.append(location(sheet.name, ref))
-                else:
-                    text = text[:index] + "\x00" + text[index + len(value):]
-            report.append({
-                "sheet": sheet.name, "visibility": sheet.state, "page": page_no,
-                "range": populated_range([ref for ref, _ in witnesses]),
-                "populated_cells": len(witnesses), "note_cells": [item["coordinate"] for item in sheet.notes],
-                "hidden_rows_and_columns_expanded": True,
-            })
-    except (PdfReadError, ValueError, OverflowError, IndexError, TypeError) as error:
-        raise QAProblem("The worksheet preview could not be reopened.") from error
-    if unknown:
-        raise QAProblem("Some cell formats cannot be checked in the preview.", unknown[:200])
-    if incomplete:
-        raise QAProblem("The preview omits or clips one or more populated cells.", incomplete[:200])
-    return report
 
 
 def inspect_workbook(source: bytes, review: bytes, inputs: dict, mapped: dict, engine) -> QAResult:
@@ -316,10 +227,19 @@ def review_preview(candidate: bytes, checks: dict, engine) -> QAResult:
     checks["owner_visual_review"] = outcome("not_performed", "The exact candidate previews require owner visual review.")
     try:
         book = QABook(candidate)
-        rendered = engine.run("render", render_copy(candidate))
+        visible = render_copy(candidate)
+        rendered = engine.run("render", visible)
         if rendered.engine != checks["recalculation"]["evidence"]["engine"]:
-            raise EngineUnavailable("The calculation and preview engine versions differ.")
-        coverage = verify_preview(book, rendered.data)
+            checks["preview_coverage"] = outcome(
+                "not_performed", "The calculation and preview engine versions differ.",
+            )
+            return QAResult(checks, candidate, engine_changed=True)
+        witnesses = preview_witnesses(book)
+        layout, colors = measure_copy(visible, witnesses)
+        measured = engine.run("measure", layout)
+        if rendered.engine != measured.engine:
+            raise EngineUnavailable("The preview and layout engine versions differ.")
+        coverage = verify_preview(book, rendered.data, measured.data, colors, witnesses)
     except EngineUnavailable as error:
         record_failure(checks, "preview_coverage", error, unavailable=True)
         return QAResult(checks, candidate)

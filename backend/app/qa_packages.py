@@ -57,7 +57,8 @@ class QABook:
                 relations = relationships(source, WORKBOOK_RELS)
                 by_id = {item.get("Id"): item for item in relations}
                 strings = shared_strings(source, find_part(relations, "xl", "sharedStrings"), Budget())
-                formats = style_formats(source, find_part(relations, "xl", "styles"))
+                self.style_part = find_part(relations, "xl", "styles")
+                formats = style_formats(source, self.style_part)
                 self.sheets = {}
                 self.date_1904 = self.root.find(S + "workbookPr") is not None and (
                     self.root.find(S + "workbookPr").get("date1904") in {"1", "true"}

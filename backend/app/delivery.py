@@ -205,7 +205,9 @@ async def compute_qa(request, inputs, artifact, previous) -> QAResult:
                 checks["artifact_integrity"] = outcome("not_performed", "Private workbook storage is unavailable.")
                 return QAResult(checks)
             if candidate is not None:
-                return await to_thread.run_sync(review_preview, candidate, dict(previous["checks"]), engine)
+                resumed = await to_thread.run_sync(review_preview, candidate, dict(previous["checks"]), engine)
+                if not resumed.engine_changed:
+                    return resumed
         mapping = {item["original"]: item["copied"] for item in artifact["report"]["source_sheets"]}
         return await to_thread.run_sync(inspect_workbook, source, generated, accounting_evidence(inputs), mapping, engine)
 

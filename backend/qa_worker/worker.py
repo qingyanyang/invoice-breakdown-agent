@@ -20,7 +20,7 @@ PDF_FILTER = 'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":
 
 def execute(operation):
     data = sys.stdin.buffer.read(LIMIT + 1)
-    if operation not in {"calculate", "render"} or not data or len(data) > LIMIT:
+    if operation not in {"calculate", "render", "measure"} or not data or len(data) > LIMIT:
         raise ValueError("Invalid worker request.")
     with TemporaryDirectory(prefix="invoice-qa-") as directory:
         root = Path(directory)

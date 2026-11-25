@@ -12,17 +12,19 @@ from zipfile import ZipFile
 
 import pytest
 from lxml import etree as xml
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app import classification_model, main
 from app.allocation import AllocationPolicy, allocate
 from app.checkpoints import setup_checkpoints
 from app.config import settings
 from app.extraction_reader import extract_workbook
-from app.qa_checks import CHECKS, MACHINE_CHECKS, actual_errors, verify_preview
-from app.qa_engine import EngineUnavailable, QAEngine, decode_result
+from app.qa_checks import CHECKS, MACHINE_CHECKS, actual_errors
+from app.qa_engine import EngineResult, EngineUnavailable, QAEngine, decode_result
 from app.qa_packages import S, QAProblem, QABook, candidate_from_calculation, remove_values, strip_formula_caches
+from app.qa_preview import MARKER_START, measure_copy, preview_witnesses, verify_preview
 from app.reconcile import reconcile
 from app.reconciliation_evidence import Reference
 from app.workbook_generation import generate_workbook
@@ -133,9 +135,72 @@ def test_preview_rejects_missing_or_truncated_content():
     buffer = BytesIO()
     pdf.write(buffer)
     with pytest.raises(QAProblem, match="omits or clips") as error:
-        verify_preview(book, buffer.getvalue())
+        verify_preview(book, buffer.getvalue(), buffer.getvalue(), {name: {} for name in book.sheets}, preview_witnesses(book))
     assert {"sheet": "Invoice Breakdown", "cell": "A1"} in error.value.locations
     assert {"sheet": "Notes", "cell": "A1"} in error.value.locations
+
+
+def single_cell_book():
+    workbook = Workbook()
+    workbook.active["A1"] = "Unique text"
+    output = BytesIO()
+    workbook.save(output)
+    return QABook(output.getvalue())
+
+
+def text_pdf(instructions):
+    pdf = PdfWriter()
+    page = pdf.add_blank_page(612, 792)
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({
+            NameObject("/F1"): DictionaryObject({
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+            }),
+        }),
+    })
+    content = DecodedStreamObject()
+    content.set_data(instructions)
+    page.replace_contents(content)
+    output = BytesIO()
+    pdf.write(output)
+    return output.getvalue()
+
+
+@pytest.mark.parametrize("instructions", [
+    b"BT /F1 12 Tf 900 900 Td (Unique text) Tj ET",
+    b"BT /F1 12 Tf 130 770 Td (Unique text) Tj ET",
+    b"q 0 755 40 36 re W n BT /F1 12 Tf 10 770 Td (Unique text) Tj ET Q",
+    b"BT /F1 12 Tf 10 770 Td 3 Tr (Unique text) Tj ET",
+], ids=["off-page", "wrong-cell", "clip-path", "invisible-text"])
+def test_preview_requires_visible_text_inside_its_cell(instructions):
+    book = single_cell_book()
+    bounds = text_pdf(b"0.066666667 0 0.0039215686 rg 0 755 100 36 re f")
+    colors = {"Sheet": {MARKER_START: "A1"}}
+    witnesses = preview_witnesses(book)
+    good = text_pdf(b"BT /F1 12 Tf 10 770 Td (Unique text) Tj ET")
+    assert verify_preview(book, good, bounds, colors, witnesses)[0]["range"] == "A1"
+    with pytest.raises(QAProblem, match="omits or clips") as error:
+        verify_preview(book, text_pdf(instructions), bounds, colors, witnesses)
+    assert error.value.locations == [{"sheet": "Sheet", "cell": "A1"}]
+
+
+def test_real_preview_checks_text_across_a_visible_merged_cell(real_engine):
+    workbook = Workbook()
+    workbook.active.merge_cells("A1:C2")
+    workbook.active["A1"] = "Merged text spans columns"
+    workbook.active["D3"] = "End of the print area"
+    workbook.active.column_dimensions["D"].width = 32
+    output = BytesIO()
+    workbook.save(output)
+    data = output.getvalue()
+    book = QABook(data)
+    witnesses = preview_witnesses(book)
+    layout, colors = measure_copy(data, witnesses)
+    preview = real_engine.run("render", data).data
+    measured = real_engine.run("measure", layout).data
+    assert verify_preview(book, preview, measured, colors, witnesses)[0]["range"] == "A1:D3"
 
 
 async def start_delivery(client, source, target="282.54"):
@@ -184,7 +249,7 @@ async def test_delivery_of_exact_candidate_requires_all_owner_checks_and_expires
         assert paused["status"] == "blocked" and paused["candidate"] is not None
         assert paused["checks"]["preview_coverage"]["status"] == "not_performed"
         qa = success(await client.post(qa_path, headers=ALICE, json=payload))
-        assert calls == ["calculate", "render", "render"]
+        assert calls == ["calculate", "render", "render", "measure"]
         assert qa["candidate"] == paused["candidate"]
         assert qa["status"] == "awaiting_visual_review", json.dumps(qa["checks"], ensure_ascii=False)
         assert all(qa["checks"][name]["status"] == "passed" for name in MACHINE_CHECKS)
@@ -231,6 +296,94 @@ async def test_delivery_of_exact_candidate_requires_all_owner_checks_and_expires
         }))
         assert (await client.get(task + "/delivery/download", headers=ALICE)).status_code == 409
         assert (await client.post(qa_path + "/visual-review", headers=ALICE, json=approved_input)).status_code == 409
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("changed", [
+    {"D4": "111", "D5": "54"},
+    {"D6": "166"},
+])
+async def test_delivery_blocks_changed_recalculated_detail_and_subtotals(
+    task_runtime, configured_skill, monkeypatch, real_engine, changed,
+):
+    monkeypatch.setattr(classification_model, "propose", fixture_model)
+    await setup_checkpoints(settings)
+    calls = []
+
+    class ChangedCaches:
+        def run(self, operation, data):
+            calls.append(operation)
+            result = real_engine.run(operation, data)
+            if operation == "calculate":
+                book = QABook(result.data, engine_output=True)
+                sheet = book.sheets["Trade Summary"]
+                for ref, value in changed.items():
+                    sheet.nodes[ref].find(S + "v").text = value
+                return EngineResult(book.dump([sheet]), result.engine)
+            return result
+
+    async with service() as client:
+        main.app.state.qa_engine = ChangedCaches()
+        task, artifact = await start_delivery(client, (FIXTURES / "reconciliation.xlsx").read_bytes())
+        qa = success(await client.post(task + "/delivery/qa", headers=ALICE, json={
+            **START, "expected_artifact_id": artifact["artifact_id"],
+        }))
+        assert qa["status"] == "blocked"
+        assert qa["checks"]["recalculation"]["status"] == "passed"
+        assert qa["checks"]["source_preservation"]["status"] == "passed"
+        finance = qa["checks"]["financial_reconciliation"]
+        assert finance["status"] == "failed"
+        assert finance["locations"] == [{"sheet": "Trade Summary", "cell": ref} for ref in changed]
+        assert calls == ["calculate"]
+        assert (await client.get(task + "/delivery/download", headers=ALICE)).status_code == 409
+
+
+@pytest.mark.anyio
+async def test_delivery_recalculates_when_the_worker_changes_between_retries(
+    task_runtime, configured_skill, monkeypatch, real_engine,
+):
+    monkeypatch.setattr(classification_model, "propose", fixture_model)
+    await setup_checkpoints(settings)
+    calls = []
+
+    class UpgradedEngine:
+        upgraded = False
+
+        def run(self, operation, data):
+            calls.append(operation)
+            if operation == "render" and not self.upgraded:
+                raise EngineUnavailable("The renderer is temporarily unavailable.")
+            result = real_engine.run(operation, data)
+            if not self.upgraded:
+                return result
+            if operation == "calculate":
+                book = QABook(result.data, engine_output=True)
+                sheet = book.sheets["Trade Summary"]
+                # Equivalent amount with different bytes makes stale candidate reuse observable.
+                sheet.nodes["D4"].find(S + "v").text = "110.0"
+                result = EngineResult(book.dump([sheet]), result.engine)
+            return EngineResult(result.data, "upgraded test worker")
+
+    async with service() as client:
+        worker = UpgradedEngine()
+        main.app.state.qa_engine = worker
+        task, artifact = await start_delivery(client, (FIXTURES / "reconciliation.xlsx").read_bytes())
+        path = task + "/delivery/qa"
+        payload = {**START, "expected_artifact_id": artifact["artifact_id"]}
+        paused = success(await client.post(path, headers=ALICE, json=payload))
+        assert paused["status"] == "blocked" and paused["preview"] is None
+        worker.upgraded = True
+        resumed = success(await client.post(path, headers=ALICE, json=payload))
+        assert resumed["status"] == "awaiting_visual_review", json.dumps(resumed["checks"], ensure_ascii=False)
+        assert calls == ["calculate", "render", "render", "calculate", "render", "measure"]
+        assert resumed["qa_id"] != paused["qa_id"]
+        assert resumed["candidate"]["sha256"] != paused["candidate"]["sha256"]
+        assert resumed["checks"]["recalculation"]["evidence"]["engine"] == "upgraded test worker"
+        assert (await client.post(path + "/visual-review", headers=ALICE, json={
+            **visual_request(resumed), "candidate_sha256": paused["candidate"]["sha256"],
+        })).status_code == 409
+        ready = success(await client.post(path + "/visual-review", headers=ALICE, json=visual_request(resumed)))
+        assert ready["status"] == "ready_for_delivery"
 
 
 @pytest.mark.anyio

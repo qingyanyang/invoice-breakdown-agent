@@ -476,16 +476,22 @@ It imports only results for matching formula coordinates and expressions
 into the original workbook package. It then removes the review banner
 from the candidate, verifies that all other worksheet content and layout
 still match, and replays scope and allocation against candidate amounts.
-Actual error cells or a nonzero displayed difference block release.
-The versioned candidate is stored separately and checked before release.
+Each source contributor, authorized addition, subtotal, and control total
+must match its independent calculation at the reconciliation's cent
+precision. Actual formula errors and nonzero displayed differences also
+block release. The versioned candidate is stored separately.
 
 The PDF is rendered from the candidate with hidden sheet, row, and column
-content exposed for inspection on a disposable preview copy. Each page
-must cover its recorded worksheet and match the expected visible content.
-Unsupported formats, missing coverage, and clipped content prevent approval.
+content exposed on a disposable preview copy. A separate layout pass
+measures the cell rectangles. Expected text must be painted in its own
+cell region within the page and clipping bounds. Unsupported formats,
+missing coverage, and clipped content prevent approval. The owner still
+reviews readability and layout on the candidate's preview.
+
 When rendering is temporarily unavailable, a retry resumes from the saved
-candidate. A replacement workbook or candidate requires new evidence and
-owner approval.
+candidate if the worker identity agrees. A changed worker version or
+image restarts recalculation and rendering. Changes to the workbook,
+candidate, or QA checks require current evidence and owner approval.
 
 ## Tests
 
