@@ -4,6 +4,10 @@ from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# The owner-approved AFLUX workflow, registered in the synthetic fixture guide.
+APPROVED_SKILL_SHA256 = "081c18b367967ae50c1d0e3d8e16b3caba21783cecfd2aed41a61bea886250ce"
+
+
 class Settings(BaseSettings):
     environment: str = "development"
     database_url: str | None = None
@@ -12,6 +16,11 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr | None = None
     classification_model: str | None = None
     classification_skill_path: Path | None = None
+    classification_skill_sha256: str = Field(default=APPROVED_SKILL_SHA256, pattern=r"^[0-9a-f]{64}$")
+    classification_skill_version: str | None = Field(
+        default=None, min_length=1, max_length=96, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    classification_rules_archive: Path | None = None
     classification_codex_path: Path | None = None
     qa_worker_image: str | None = None
     qa_docker_runtime: str = "docker"

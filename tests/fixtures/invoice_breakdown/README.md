@@ -1,14 +1,23 @@
 # Invoice Breakdown specifications and fixtures
 
-The business owner confirmed **Invoice.Breakdown.Codex.md**, version **2026-10-05**. Its SHA-256 is:
+The approved **SKILL.md** workflow is the primary specification. Its SHA-256 is:
+
+```text
+081c18b367967ae50c1d0e3d8e16b3caba21783cecfd2aed41a61bea886250ce
+```
+
+The business owner also confirmed **Invoice.Breakdown.Codex.md**, version
+**2026-10-05**, as a supplementary reference. Its SHA-256 is:
 
 ```text
 28a43a6165cbdc62820251fdc969234da8cbd31e0d147151f0f1960f550a98a4
 ```
 
-Obtain the approved Markdown file from the business owner. Verify it with
-`shasum -a 256 /path/to/Invoice.Breakdown.Codex.md`. Read the approved file in
-full when first loaded for a task and pin one version for that task.
+Obtain approved Markdown files from the business owner. Verify their
+checksums with `shasum -a 256`. Load the full approved primary document
+and pin one version per task. Classification uses sections IV–V of the
+optional Codex when the configured file matches its registered checksum
+and the task's pin.
 
 If the reference is missing or copies conflict, record the unresolved input in
 the work item. Include the expected filename and version, where you checked,

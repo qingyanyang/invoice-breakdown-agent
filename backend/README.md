@@ -269,7 +269,11 @@ particularly sections II, III, VI and X.
 
 Set `CLASSIFICATION_SKILL_PATH` to the approved `SKILL.md` file and make the
 file available to the backend. For a container, mount it read-only and use
-its path inside the container. Configure `CLASSIFICATION_MODEL` with an
+its path inside the container. `CLASSIFICATION_SKILL_SHA256` defaults to
+the approved workflow checksum in the fixture guide. Set it explicitly
+when deploying a newly approved copy. `CLASSIFICATION_SKILL_VERSION` is
+an optional approved version label. Without a label the checksum is the
+version identifier. Configure `CLASSIFICATION_MODEL` with an
 OpenAI model that supports strict structured outputs, and supply `LLM_API_KEY`
 through the deployment secret or a private local environment. Enable the
 provider only for workbook evidence the company allows it to process.
@@ -289,6 +293,54 @@ Run `alembic upgrade head` explicitly before enabling classification.
 | `POST /tasks/{id}/classification` | Send `expected_revision` after reconciliation is ready. Starts classification or returns the current result. Retry here after addressing a failed attempt. |
 | `GET /tasks/{id}/classification` | Read current assignments, evidence, pending questions, accepted answers and the SHA-256 of the primary specification. |
 | `POST /tasks/{id}/classification/answers` | Send `expected_revision`, the current `question_id`, one offered `answer` and a `reason` when required. |
+| `GET /tasks/{id}/rules` | Read the task's pin or `null` before its first verification. Use `?revision=N` for an earlier revision. |
+| `POST /tasks/{id}/rules/upgrade` | Send `expected_revision` and the configured approved `primary_sha256` to explicitly adopt newer rules in a new task revision. Supports an optional `Idempotency-Key`. |
+
+### Pin and retrieve approved rules
+
+Classification pins the verified primary checksum and any verified
+supplement the first time it loads approved rules for a task. The pin
+persists through retries, service restarts and ordinary task revisions.
+Keep earlier versions in a private, read-only rules archive configured
+with `CLASSIFICATION_RULES_ARCHIVE`. The service looks for
+`<archive>/<primary-sha256>/SKILL.md` when the configured primary file
+cannot satisfy an earlier pin. It verifies the bytes before use.
+An unavailable or mismatched primary blocks a new classification.
+An existing published classification remains readable. Owner answers
+can use its persisted proposal and provenance after a restart.
+When legacy results document mixed rule versions, an explicit upgrade is
+required before new classification can use an approved version.
+
+Upgrading is an owner action that verifies the requested checksum against
+the configured approved version and creates a new revision. The new
+revision references the same immutable source bytes and uses the existing
+workflow gates. Earlier classification, allocation, workbook and QA
+records remain attached to their original revisions. To classify and
+deliver under the new pin, run the normal workflow for the new revision.
+Apply Alembic migration `0013_task_rule_pins` via `alembic upgrade head`.
+
+Rule search uses deterministic phrase matching and a fixed, versioned
+passage map. It selects up to six approved passages from the exact
+verified primary document, using current row descriptions, area labels,
+and reconciled scope cues. Each passage records its document, approved
+version, checksum, section, immutable ID, exact excerpt, and source
+references where the search matched. The full pinned primary is loaded
+for every new model proposal. An incompatible optional Codex file is
+never supplied. Optional search can return no match, version mismatch,
+or unavailable, in which case classification continues with the full
+verified primary. The execution fingerprint records the primary checksum,
+the supplementary version actually sent, and the retrieval configuration
+version. Current-project scope and amounts still follow the existing
+source evidence and deterministic checks.
+
+The focused retrieval suite tests section relevance, scope and combined
+areas, no match, version isolation, and exclusion of historical example
+amounts. Integration tests use synthetic workbooks, disposable PostgreSQL,
+and a mocked model. They include a current authorized amount identical
+to a historical example amount. That current amount is preserved.
+Real-model behavioral evaluation of rule application and historical-data
+contamination remains unperformed.
+
 
 Classification carries forward the exact signed amount of each reconciled
 row and keeps a single coverage entry per row. The code checks the model's

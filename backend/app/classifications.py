@@ -1,6 +1,7 @@
 """Persist proposals and owner decisions behind the current reconciliation gate."""
 
 import logging
+from dataclasses import asdict, replace
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -11,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from app import classification_model
+from app import classification_model, rule_retrieval
 from app.classification_evidence import ClassificationEvidenceError
 from app.classification_model import ClassificationModelError
 from app.classification_tables import source_classifications
@@ -21,7 +22,9 @@ from app.execution import ExecutionFailure, acquire, claim, executing, fence, se
 from app.extractions import ExtractionDetails
 from app.operators import Operator
 from app.reconciliations import ReconciliationDetails, reconciliation_record, require_extraction
+from app.reconciliation_evidence import Reference
 from app.request_receipts import ReceiptKey, RequestKey, save_receipt
+from app.task_rules import applied_supplementary, load_verified_rules, primary_document, rule_pin, save_pin
 from app.tasks import database_for, lock_current_revision, owned_revision, reserve_owned_receipt, transaction
 from app.workflows import RevisionRequest
 
@@ -95,22 +98,67 @@ async def save_classification(connection, reconciliation, proposal_id, skill, mo
     return ClassificationDetails.model_validate(row)
 
 
+def search_inputs(model_inputs, reconciliation):
+    scope_rows = [
+        {"row": Reference.from_dict(item["reference"]).key, "description": item["description"]}
+        for name in ("scope_additions", "scope_exclusions", "outside_source_scope")
+        for item in reconciliation.report[name][:rule_retrieval.MAX_QUERY_ROWS]
+        if not rule_retrieval.HISTORY.search(item["description"])
+    ]
+    return {**model_inputs, "scope_rows": scope_rows}
+
+
 @router.post("")
 async def run_classification(
     task_id: UUID, payload: RevisionRequest, request: Request, operator: Operator,
 ) -> ClassificationDetails:
     engine = database_for(request)
 
+    async with transaction(engine) as connection:
+        revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
+        _, original_reconciliation = await classification_inputs(connection, revision)
+        existing = await classification_record(connection, original_reconciliation)
+        if existing is not None and existing["status"] != "failed":
+            return ClassificationDetails.model_validate(existing)
+        original_pin = await rule_pin(connection, revision)
+
+    verified = rules_error = None
+    try:
+        verified = await load_verified_rules(request, original_pin)
+    except ClassificationModelError as error:
+        rules_error = error
+
+    expected_primary = (
+        original_pin.primary if original_pin else primary_document(
+            settings.classification_skill_sha256, settings.classification_skill_version,
+        )
+    )
+    primary = verified.pin.primary if verified else expected_primary
+    supplement = applied_supplementary(verified.specification) if verified else None
+    rule_identity = {
+        "primary": asdict(primary), "supplementary": asdict(supplement) if supplement else None,
+        "retrieval_configuration": rule_retrieval.RETRIEVAL_VERSION,
+    }
+
     async def prepare(connection):
         revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
         extraction, reconciliation = await classification_inputs(connection, revision)
+        if reconciliation != original_reconciliation:
+            raise HTTPException(409, "Current source or reconciliation has changed")
         existing = await classification_record(connection, reconciliation)
         if existing is not None and existing["status"] != "failed":
             return ClassificationDetails.model_validate(existing), None
+
+        current_pin = await rule_pin(connection, revision)
+        if current_pin != original_pin and (verified is None or current_pin != verified.pin):
+            raise HTTPException(409, "The approved rule pin has changed")
+        if verified is not None and await rule_pin(connection, revision, infer_legacy=False) is None:
+            await save_pin(connection, task_id, revision["revision"], verified.pin)
+
         attempt = await claim(
             connection, revision, operator, "classification",
             [identity(reconciliation), reconciliation.source_sha256, CLASSIFIER_VERSION, settings.classification_model,
-             bool(settings.llm_api_key), str(settings.classification_skill_path), str(settings.classification_codex_path)],
+             bool(settings.llm_api_key), rule_identity, rules_error.code if rules_error else None],
             settings.execution_classification_seconds,
         )
         return (extraction, reconciliation), attempt
@@ -122,20 +170,29 @@ async def run_classification(
     extraction, reconciliation = inputs
     async with executing(engine, attempt):
         skill_sha256 = proposal = supplementary = None
+        retrieval = rule_retrieval.RetrievalResult("not_performed")
         model = settings.classification_model
         proposal_id = uuid4()
         try:
-            specification = await classification_model.load_primary_specification(
-                settings.classification_skill_path, settings.classification_codex_path,
-            )
+            if rules_error is not None:
+                raise rules_error
+            specification = verified.specification
             skill_sha256 = specification.sha256
             supplementary = specification.supplementary.provenance()
             if supplementary["status"] not in {"applied", "not_configured"}:
                 logger.warning("Supplementary classification rules unavailable: %s", supplementary["status"])
             evidence = await to_thread.run_sync(make_evidence, extraction.result, reconciliation.report)
-            inputs = await to_thread.run_sync(evidence.model_input)
+            model_inputs = await to_thread.run_sync(evidence.model_input)
+            try:
+                retrieval = rule_retrieval.search_rules(
+                    specification.text, specification.sha256, primary, search_inputs(model_inputs, reconciliation),
+                )
+            except Exception as error:
+                logger.warning("Approved rule retrieval unavailable: %s", type(error).__name__)
+                retrieval = rule_retrieval.RetrievalResult("unavailable")
+            specification = replace(specification, retrieved_rules=retrieval.passages)
             async with request.app.state.classification_limiter:
-                proposal = await classification_model.propose(settings, specification, inputs)
+                proposal = await classification_model.propose(settings, specification, model_inputs)
             report = await to_thread.run_sync(build_classification, evidence, proposal, {}, str(proposal_id))
         except (ClassificationEvidenceError, ClassificationModelError) as error:
             logger.warning("Classification unavailable: %s", error.code)
@@ -143,12 +200,15 @@ async def run_classification(
             proposal = None
         if supplementary is not None:
             report["supplementary_rules"] = supplementary
+        report["rule_context"] = {**rule_identity, "retrieval": retrieval.report(), "primary_verified": verified is not None}
 
         async with transaction(engine) as connection:
             revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
             _, latest = await classification_inputs(connection, revision)
-            if identity(latest) != identity(reconciliation) or latest.source_sha256 != reconciliation.source_sha256:
+            if latest != reconciliation:
                 raise HTTPException(409, "Current source or reconciliation has changed")
+            if verified is not None and await rule_pin(connection, revision) != verified.pin:
+                raise HTTPException(409, "The approved rule pin has changed")
             await fence(connection, attempt)
             current = await classification_record(connection, latest)
             if current is not None and current["status"] != "failed":
@@ -173,6 +233,9 @@ async def run_classification(
 
 def classification_response(result, headers=None):
     if result.status == "failed":
+        error = result.report["error"]
+        if error in {"primary_specification_unavailable", "primary_specification_mismatch"}:
+            raise HTTPException(503, {"code": error, "message": "Approved primary rules are unavailable"}, headers=headers)
         raise HTTPException(503, "Classification unavailable. Read the recorded outcome for details.", headers=headers)
     return result
 
@@ -209,10 +272,9 @@ def classification_decisions(current, payload, operator):
     }
 
 
-def replay_proposal(extraction, reconciliation, proposal, decisions, proposal_id, supplementary):
+def replay_proposal(extraction, reconciliation, proposal, decisions, proposal_id, provenance):
     report = build_classification(make_evidence(extraction, reconciliation), proposal, decisions, str(proposal_id))
-    report["supplementary_rules"] = supplementary
-    return report
+    return {**report, **provenance}
 
 
 @router.post("/answers")
@@ -237,7 +299,8 @@ async def answer_classification(
         decisions = classification_decisions(current, payload, operator)
         attempt = await claim(
             connection, revision, operator, "classification_answer",
-            [identity(reconciliation), reconciliation.source_sha256, CLASSIFIER_VERSION, current["proposal_id"], decisions],
+            [identity(reconciliation), reconciliation.source_sha256, CLASSIFIER_VERSION,
+             current["proposal_id"], current["report"].get("rule_context"), decisions],
             settings.execution_rules_seconds,
         )
         return (extraction, reconciliation, current, decisions), attempt
@@ -247,11 +310,14 @@ async def answer_classification(
         return inputs
     extraction, reconciliation, prior, decisions = inputs
     proposal = Proposal.model_validate(prior["proposal"])
+    provenance = {
+        name: prior["report"][name] for name in ("supplementary_rules", "rule_context") if name in prior["report"]
+    }
     async with executing(engine, attempt):
         try:
             report = await to_process.run_sync(
                 replay_proposal, extraction.result, reconciliation.report, proposal, decisions,
-                prior["proposal_id"], prior["report"]["supplementary_rules"], cancellable=True,
+                prior["proposal_id"], provenance, cancellable=True,
             )
         except BrokenWorkerProcess:
             raise ExecutionFailure(503, "Classification unavailable", "classification_worker_unavailable", retryable=True) from None

@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, Numeric, String, Table, Uuid, func,
+    CheckConstraint, Column, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, Numeric, String, Table, Uuid, func,
 )
 
 from app.database import metadata
@@ -43,5 +43,22 @@ task_revisions = Table(
         "(status = 'source_uploaded' AND source_key IS NOT NULL AND source_filename IS NOT NULL "
         "AND source_size IS NOT NULL AND source_size > 0 AND source_sha256 IS NOT NULL)",
         name="ck_task_revisions_source",
+    ),
+)
+
+
+task_rule_pins = Table(
+    "task_rule_pins",
+    metadata,
+    Column("task_id", Uuid, primary_key=True),
+    Column("revision", Integer, primary_key=True),
+    Column("primary_sha256", String(64), nullable=False),
+    Column("primary_version", String(96), nullable=False),
+    Column("supplementary_sha256", String(64)),
+    Column("supplementary_version", String(96)),
+    ForeignKeyConstraint(["task_id", "revision"], ["task_revisions.task_id", "task_revisions.revision"]),
+    CheckConstraint(
+        "(supplementary_sha256 IS NULL) = (supplementary_version IS NULL)",
+        name="ck_task_rule_supplementary",
     ),
 )

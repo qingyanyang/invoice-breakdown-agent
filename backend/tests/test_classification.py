@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 from decimal import Decimal
 from xml.sax.saxutils import escape
 
@@ -13,6 +14,7 @@ from app.classify import Proposal, build_classification, make_evidence
 from app.config import Settings
 from app.extraction_reader import extract_workbook
 from app.reconcile import reconcile
+from app.rule_retrieval import RuleDocument, search_rules
 from test_reconciliation import SHEET_NS, SOURCE, WORKSHEET, evidence_for, fixture
 
 SHEET = "Trade Summary"
@@ -313,6 +315,11 @@ async def test_provider_adapter_handles_result_and_failures(monkeypatch, tmp_pat
         "status": "applied", "version": "2026-10-05",
         "sha256": hashlib.sha256(codex.read_bytes()).hexdigest(), "sections": ["IV", "V"],
     }
+    approved = RuleDocument("SKILL.md", "synthetic-approved-v1", specification.sha256)
+    match = search_rules(specification.text, specification.sha256, approved, {
+        "rows": [{"row": "Untrusted sheet name!D4", "description": "FF&E"}],
+    })
+    specification = replace(specification, retrieved_rules=match.passages)
     client_class = httpx.AsyncClient
 
     def respond(request):
@@ -323,6 +330,13 @@ async def test_provider_adapter_handles_result_and_failures(monkeypatch, tmp_pat
         assert specification.text in instruction
         assert "Verified synthetic trade rules." in instruction and "Verified synthetic area rules." in instruction
         assert "Omit this" not in instruction
+        assert "Historical or unrelated examples" in instruction
+        assert "Retrieved passages from the full primary rules" in instruction
+        guidance = json.loads(instruction.rsplit("\n", 1)[1])
+        assert guidance == [{
+            "document": "SKILL.md", "version": "synthetic-approved-v1", "section": "6", "text": "FF&E maps to Doors.",
+        }]
+        assert "Untrusted sheet name" not in instruction
         assert json.loads(payload["messages"][1]["content"]) == {"rows": []}
         if result == "rate_limit":
             return httpx.Response(429, text="sensitive upstream error")
