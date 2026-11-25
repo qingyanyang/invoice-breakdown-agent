@@ -27,20 +27,27 @@ class Trade(StrEnum):
 
 
 class RowProposal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     row: str = Field(min_length=1, max_length=255)
     trade: Trade | None
     trade_evidence: list[str] = Field(max_length=12)
-    reason: str = Field(min_length=1, max_length=800)
     area: str | None = Field(max_length=255)
     glazing_price: str | None = Field(max_length=255)
 
 
 class Proposal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     rows: list[RowProposal] = Field(max_length=300)
+
+    @classmethod
+    def from_storage(cls, proposal: dict):
+        # Earlier proposals included model-authored free text. Rebuild the
+        # rationale from validated source references when replaying them.
+        return cls.model_validate({"rows": [
+            {key: value for key, value in row.items() if key != "reason"} for row in proposal["rows"]
+        ]})
 
 
 def make_evidence(extraction: dict, report: dict) -> ClassificationEvidence:
@@ -107,7 +114,11 @@ class ClassificationRun:
             ):
                 scope_hold = self.resolve_scope(row, panel_notes)
             model_reviews.append({
-                "row": key, "trade": proposed.trade, "reason": proposed.reason, "evidence": refs,
+                "row": key, "trade": proposed.trade, "evidence": refs,
+                "reason": (
+                    f"The model proposed {proposed.trade} from {row.label.key}: {row.description}"
+                    if proposed.trade else f"The model requested clarification on {row.label.key}: {row.description}"
+                ),
                 "area": proposed.area, "glazing_price": proposed.glazing_price,
             })
             assigned = bool(pieces) and area is not None and not scope_hold
@@ -141,7 +152,8 @@ class ClassificationRun:
 
         return {
             "status": status, "error": None, "questions": self.questions, "assignments": self.assignments,
-            "row_coverage": coverage, "model_proposals": model_reviews, "gst_basis": self.evidence.gst_basis,
+            "row_coverage": coverage, "model_proposals": model_reviews, "rationale_origin": "current_workbook",
+            "gst_basis": self.evidence.gst_basis,
             "working_scope_total": format(self.evidence.total, "f"),
             "classified_total_exact": format(total, "f") if total is not None else None,
             "classified_total": format(cents(total), "f") if total is not None else None,

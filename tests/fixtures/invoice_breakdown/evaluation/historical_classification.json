@@ -1,0 +1,7 @@
+{
+  "purpose": "Historical-data isolation in classification",
+  "historical_amount": "98765.43",
+  "historical_reference": "Our earlier job included FF&E at AUD 98,765.43.",
+  "unsupported_rationale": "This project's FF&E cost was $98,765.43.",
+  "current_amount": "150.00"
+}

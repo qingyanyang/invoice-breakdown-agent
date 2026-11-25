@@ -21,7 +21,6 @@ def model_answer(inputs, by_row):
         {
             "row": row["row"], "trade": by_row.get(row["row"], "Other"),
             "trade_evidence": [row["description_reference"]],
-            "reason": "The specific workbook description supports this trade.",
             "area": None, "glazing_price": None,
         }
         for row in inputs["rows"]
@@ -32,6 +31,7 @@ def model_answer(inputs, by_row):
 def configured_skill(monkeypatch, tmp_path):
     skill = write_skill(tmp_path)
     monkeypatch.setattr(settings, "classification_skill_path", skill)
+    monkeypatch.setattr(settings, "classification_skill_sha256", hashlib.sha256(skill.read_bytes()).hexdigest())
     monkeypatch.setattr(settings, "classification_codex_path", None)
     monkeypatch.setattr(settings, "classification_model", "example-model")
     return skill
@@ -120,6 +120,7 @@ async def test_classification_resumes_persisted_scope_answer_after_restart(
         result = success(await client.get(path, headers=ALICE))
         assert result["status"] == "ready_for_allocation" and result["report"]["classified_total"] == "100.00"
         assert result["report"]["supplementary_rules"] == draft["report"]["supplementary_rules"]
+        assert result["report"]["rule_context"] == draft["report"]["rule_context"]
         assert result["decisions"][question["key"]]["operator"] == "alice"
         assert result["decisions"][question["key"]]["evidence"] == question["evidence"]
         panel, _ = result["report"]["assignments"]
@@ -244,7 +245,8 @@ async def test_model_failure_is_persisted_and_retryable(task_runtime, configured
         assert (await client.post(path, headers=ALICE, json=START)).status_code == 503
         failed_record = success(await client.get(path, headers=ALICE))
         assert failed_record["status"] == "failed"
-        assert failed_record["report"] == {
+        assert failed_record["report"]["rule_context"]["primary_verified"] is True
+        assert {name: value for name, value in failed_record["report"].items() if name != "rule_context"} == {
             "status": "failed", "error": "invalid_model_proposal", "questions": [], "assignments": [],
             "supplementary_rules": {"status": "not_configured", "version": None, "sha256": None, "sections": []},
         }

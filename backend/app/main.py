@@ -23,6 +23,7 @@ from app.operators import operator_credentials
 from app.qa_engine import QAEngine
 from app.reconciliations import router as reconciliation_router
 from app.source_storage import create_output_storage, create_source_storage
+from app.task_rules import router as task_rule_router
 from app.tasks import router as task_router
 from app.worker_io import BlockingWorker, SourceReadWorker
 from app.workbooks import router as workbook_router
@@ -85,6 +86,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(task_router)
+app.include_router(task_rule_router)
 app.include_router(execution_router)
 app.include_router(workflow_router)
 app.include_router(extraction_router)

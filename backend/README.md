@@ -269,19 +269,24 @@ particularly sections II, III, VI and X.
 
 Set `CLASSIFICATION_SKILL_PATH` to the approved `SKILL.md` file and make the
 file available to the backend. For a container, mount it read-only and use
-its path inside the container. Configure `CLASSIFICATION_MODEL` with an
+its path inside the container. `CLASSIFICATION_SKILL_SHA256` defaults to
+the approved workflow checksum in the fixture guide. Set it explicitly
+when deploying a newly approved copy. `CLASSIFICATION_SKILL_VERSION` is
+an optional approved version label. Without a label the checksum is the
+version identifier. Configure `CLASSIFICATION_MODEL` with an
 OpenAI model that supports strict structured outputs, and supply `LLM_API_KEY`
 through the deployment secret or a private local environment. Enable the
 provider only for workbook evidence the company allows it to process.
-The request sends the full primary specification, current working-row
+The request sends the full operational primary specification, current working-row
 descriptions, relevant source labels and Notes. The source workbook, target
 amount and operator credentials stay in the service. Optionally set
 `CLASSIFICATION_CODEX_PATH` to the approved `Invoice.Breakdown.Codex.md`.
 The backend checks the registered 2026-10-05 SHA-256 and sends only its
 classification and area sections (IV–V). The report records whether the
 supplement was applied, with its checksum and chapters when verified.
-Classification can proceed from `SKILL.md` alone when the supplement is
-absent or fails verification.
+A task can start from `SKILL.md` alone when the supplement is absent or
+fails verification. A task that pinned a supplement requires that version
+for each new classification.
 Run `alembic upgrade head` explicitly before enabling classification.
 
 | Method and path | Request and result |
@@ -289,11 +294,73 @@ Run `alembic upgrade head` explicitly before enabling classification.
 | `POST /tasks/{id}/classification` | Send `expected_revision` after reconciliation is ready. Starts classification or returns the current result. Retry here after addressing a failed attempt. |
 | `GET /tasks/{id}/classification` | Read current assignments, evidence, pending questions, accepted answers and the SHA-256 of the primary specification. |
 | `POST /tasks/{id}/classification/answers` | Send `expected_revision`, the current `question_id`, one offered `answer` and a `reason` when required. |
+| `GET /tasks/{id}/rules` | Read the task's pin or `null` before its first verification. Use `?revision=N` for an earlier revision. |
+| `POST /tasks/{id}/rules/upgrade` | Send `expected_revision` and the configured approved `primary_sha256` to change the rules in a new task revision. Omit `supplementary_sha256` to retain the existing selection, supply the configured and verified checksum to select it, or pass `null` for primary-only classification. Supports an optional `Idempotency-Key`. |
+
+### Pin and retrieve approved rules
+
+Classification pins the verified primary checksum and any verified
+supplement the first time it loads approved rules for a task. The pin
+persists through retries, service restarts and ordinary task revisions.
+Keep pinned versions in a private, read-only rules archive configured
+with `CLASSIFICATION_RULES_ARCHIVE`. When the configured files cannot
+satisfy a pin, the service checks `<archive>/<primary-sha256>/SKILL.md`
+and `<archive>/<supplementary-sha256>/Invoice.Breakdown.Codex.md`.
+It verifies each document against its own pinned checksum. A missing or
+mismatched pinned document blocks new classification. Restore that
+version or explicitly change the rule selection.
+An existing published classification remains readable. Owner answers
+can use its persisted proposal and provenance after a restart.
+When legacy results document mixed rule versions, explicitly select the
+primary and supplementary rules through the upgrade endpoint.
+
+Upgrading is an owner action that verifies the requested checksum against
+the configured approved version and creates a new revision. The new
+revision references the same immutable source bytes and uses the existing
+workflow gates. Earlier classification, allocation, workbook and QA
+records remain attached to their original revisions. To classify and
+deliver under the new pin, run the normal workflow for the new revision.
+Apply Alembic migration `0013_task_rule_pins` via `alembic upgrade head`.
+
+Rule search uses deterministic phrase matching and a fixed, versioned
+passage map. It selects up to six approved passages from the exact
+verified primary document, using current row descriptions, area labels,
+and reconciled scope cues. Each passage records its document, approved
+version, checksum, section, immutable ID, exact excerpt, and source
+references where the search matched. The service verifies and loads the full
+pinned operational file for every new model proposal. Historical examples
+live in evaluation fixtures that the application never reads. Keep literal
+project amounts in authorized current workbooks. The operational rules loader
+rejects evaluation blocks and nonzero currency amounts, while preserving
+the approved zero-difference rule and monetary formatting instructions.
+A mixed primary file blocks classification even when its checksum matches.
+A mixed supplement is withheld, and classification blocks if the task
+requires that pinned version. If optional search finds no match, encounters
+a version mismatch, or is unavailable, classification uses the same verified
+operational rules. The execution fingerprint records the primary checksum,
+the supplementary version actually sent, and the retrieval configuration
+version. Current-project scope and amounts still follow the existing
+source evidence and deterministic checks.
+
+The focused retrieval suite tests section relevance, scope and combined
+areas, no match, version isolation, and exclusion of historical example
+amounts. Integration tests use synthetic workbooks, disposable PostgreSQL,
+and a mocked model. They verify that mixed rules fail before search or a
+provider request, that the full verified operational rules reach the
+provider, and that an unsupported model claim is rejected before it can be
+stored. A current authorized amount identical to a historical example is
+preserved.
+Real-model behavioral evaluation of rule application and historical-data
+contamination remains unperformed.
+
 
 Classification carries forward the exact signed amount of each reconciled
 row and keeps a single coverage entry per row. The code checks the model's
 references and trade labels, row coverage and amount conservation.
-Semantic proposals retain their rationale and provenance for review. An
+The review rationale quotes a cited current source cell and identifies the
+model's proposed trade or request for clarification. Cached reports and
+historical receipts omit legacy, model-written rationales. Recorded
+assignments, amounts and owner decisions remain available. An
 owner's answer is recorded as a confirmed interpretation and carries no
 new price. Complete classification reaches `ready_for_allocation`.
 
