@@ -86,7 +86,7 @@ class LocalSourceStorage:
 
 
 class AzureSourceStorage:
-    def __init__(self, config: Settings):
+    def __init__(self, config: Settings, *, container: str | None = None):
         self.credential = ManagedIdentityCredential(client_id=config.azure_client_id)
         self.service = BlobServiceClient(
             config.azure_storage_blob_endpoint,
@@ -95,7 +95,8 @@ class AzureSourceStorage:
             read_timeout=15,
             retry_total=1,
         )
-        self.container = self.service.get_container_client(config.azure_storage_documents_container)
+        container_name = config.azure_storage_documents_container if container is None else container
+        self.container = self.service.get_container_client(container_name)
 
     def put(self, key: str, data: bytes) -> None:
         try:
@@ -127,6 +128,14 @@ class AzureSourceStorage:
 def create_source_storage(config: Settings) -> SourceStorage | None:
     if config.azure_storage_blob_endpoint:
         return AzureSourceStorage(config)
+    if config.source_storage_directory:
+        return LocalSourceStorage(config.source_storage_directory)
+    return None
+
+
+def create_output_storage(config: Settings) -> SourceStorage | None:
+    if config.azure_storage_blob_endpoint:
+        return AzureSourceStorage(config, container=config.azure_storage_processed_documents_container)
     if config.source_storage_directory:
         return LocalSourceStorage(config.source_storage_directory)
     return None

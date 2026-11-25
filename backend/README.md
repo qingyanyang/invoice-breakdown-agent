@@ -376,6 +376,52 @@ Run `alembic upgrade head` to install the allocation table. The report
 persists the approved inputs, protection provenance, factor, component
 amounts and rounding checks for workbook generation.
 
+## Generate an owner-review workbook
+
+Run `alembic upgrade head` and obtain an allocation with status
+`ready_for_workbook`. Workbook output uses the existing Azure
+`AZURE_STORAGE_PROCESSED_DOCUMENTS_CONTAINER` (default `processed-documents`)
+and managed identity, or the configured persistent local storage directory
+under `outputs/`.
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /tasks/{id}/workbook` | Send `expected_revision` and `expected_allocation_id`. Generates a workbook for owner review. |
+| `GET /tasks/{id}/workbook` | Read the current artifact version, checksum, source-copy report and QA status. |
+| `GET /tasks/{id}/workbook/download` | Download the current checksummed XLSX with `X-Workbook-Status: generated_awaiting_qa`. |
+
+The task owner can retry generation for the same revision, source checksum,
+allocation ID, generator version and template version. Identical requests
+converge on one artifact. A changed input creates a new version and claims a
+unique storage key. Publication rechecks the authorized inputs under the
+task lock after generation. It verifies the stored bytes before recording
+the artifact. Failed writes expose no download, and cleanup checks the
+database for references before deleting an attempted object.
+
+The generator follows `SKILL.md` §§4, 7, 9 and 10. The summary uses the
+allocation's displayed area and trade amounts, with Excel formulas for
+totals. It includes confirmed project information and the actual GST basis.
+Targeted workbooks include Adjustment Detail. No-target workbooks show the
+formula for the difference between their displayed total and the reconciled
+source amount, including any nonzero source-rounding difference.
+
+Source integrity and source-sheet fidelity are checked independently.
+The input is verified by its original checksum. Copied worksheet parts
+retain cell evidence, sheet order and visibility, styles, row and column
+layout, merged ranges and supported cell annotations. Source Evidence maps
+original names and coordinates to the copied tabs. A limited set of
+same-sheet additive and markup formulas remains active only when every
+dependency survives. Other source formulas, links and defined names are
+recorded as text. Available source caches remain unverified and missing
+values stay blank. The output contains no live external relationships.
+
+Transitional XLSX worksheet parts with the supported layout features can
+be copied. Charts, pivot tables, drawings other than legacy notes, and
+unsupported worksheet extensions block generation when encountered. The
+API identifies the sheet and feature. The workbook is marked
+`generated_awaiting_qa`. Recalculation, visual certification and final
+customer delivery authorization belong to Issue #11.
+
 ## Tests
 
 From `backend/` with the virtual environment active:
