@@ -1,19 +1,24 @@
 import logging
-from contextlib import asynccontextmanager
 from decimal import Decimal
 from hashlib import sha256
 from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from anyio import CancelScope, to_thread
+from anyio import CancelScope, fail_after, to_thread
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import insert, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from app.config import settings
+from app.execution import (
+    ExecutionFailure, acquire, claim, executing, fence, final_object_key, forget_colliding_object, object_has_live_attempt,
+    register_object, settle, transaction,
+)
 from app.operators import Operator
+from app.request_receipts import ReceiptKey, RequestKey, reserve_receipt, save_receipt
 from app.source_storage import (
     SourceAlreadyExists, SourceIntegrityError, SourceStorage, StorageError, read_verified_source,
 )
@@ -75,16 +80,6 @@ def storage_for(request: Request) -> SourceStorage:
     return storage
 
 
-@asynccontextmanager
-async def transaction(engine: AsyncEngine):
-    try:
-        async with engine.begin() as connection:
-            yield connection
-    except SQLAlchemyError as error:
-        logger.warning("Task database operation failed: %s", type(error).__name__)
-        raise HTTPException(503, "Task database unavailable") from None
-
-
 def target_fields(target: Target | None) -> dict:
     return {
         "target_amount": target.amount if target else None,
@@ -125,6 +120,13 @@ async def owned_revision(
     if row is None:
         raise HTTPException(404, "Task or revision not found")
     return row
+
+
+async def reserve_owned_receipt(connection, task_id, key):
+    if key is None:
+        return None
+    await owned_revision(connection, task_id, key.operator)
+    return await reserve_receipt(connection, key)
 
 
 async def lock_current_revision(
@@ -168,16 +170,22 @@ async def discard_unreferenced(
         referenced = await connection.scalar(
             select(task_revisions.c.task_id).where(task_revisions.c.source_key == key).limit(1)
         )
-        if referenced is not None:
+        if referenced is not None or await object_has_live_attempt(connection, final_object_key(key)):
             return False
-        await to_thread.run_sync(storage.delete, key)
-        return True
+    await to_thread.run_sync(storage.delete, key)
+    return True
 
 
 @router.post("", status_code=201)
-async def create_task(payload: CreateTask, request: Request, operator: Operator) -> TaskDetails:
-    task_id = uuid4()
+async def create_task(
+    payload: CreateTask, request: Request, operator: Operator, idempotency_key: RequestKey = None,
+) -> TaskDetails:
+    key = ReceiptKey.from_request(operator, "create_task", idempotency_key, payload)
     async with transaction(database_for(request)) as connection:
+        receipt = await reserve_receipt(connection, key)
+        if receipt is not None:
+            return TaskDetails.model_validate(receipt)
+        task_id = uuid4()
         await connection.execute(
             insert(tasks).values(id=task_id, owner=operator,
                                  operation=payload.operation, current_revision=1)
@@ -186,7 +194,8 @@ async def create_task(payload: CreateTask, request: Request, operator: Operator)
             insert(task_revisions).values(task_id=task_id, revision=1, status="awaiting_source",
                                           **target_fields(payload.target))
         )
-        return task_details(await owned_revision(connection, task_id, operator))
+        result = task_details(await owned_revision(connection, task_id, operator))
+        return await save_receipt(connection, key, result)
 
 
 @router.get("/{task_id}")
@@ -197,14 +206,19 @@ async def read_task(task_id: UUID, request: Request, operator: Operator) -> Task
 
 @router.put("/{task_id}/target")
 async def change_target(
-    task_id: UUID, payload: UpdateTarget, request: Request, operator: Operator,
+    task_id: UUID, payload: UpdateTarget, request: Request, operator: Operator, idempotency_key: RequestKey = None,
 ) -> TaskDetails:
+    key = ReceiptKey.from_request(operator, "change_target", idempotency_key, [task_id, payload])
     async with transaction(database_for(request)) as connection:
+        if (receipt := await reserve_owned_receipt(connection, task_id, key)) is not None:
+            return TaskDetails.model_validate(receipt)
         current = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
         changes = target_fields(payload.target)
         if all(current[field] == value for field, value in changes.items()):
-            return task_details(current)
-        return await append_revision(connection, current, changes)
+            result = task_details(current)
+        else:
+            result = await append_revision(connection, current, changes)
+        return await save_receipt(connection, key, result)
 
 
 @router.put(
@@ -215,43 +229,74 @@ async def change_target(
 )
 async def upload_source(
     task_id: UUID, request: Request, operator: Operator,
-    expected_revision: Annotated[int, Query(ge=1)], filename: str,
+    expected_revision: Annotated[int, Query(ge=1)], filename: str, idempotency_key: RequestKey = None,
 ) -> TaskDetails:
     engine = database_for(request)
-    storage = storage_for(request)
     async with transaction(engine) as connection:
         current = await owned_revision(connection, task_id, operator)
-        if current["revision"] != expected_revision:
+        if idempotency_key is None and current["revision"] != expected_revision:
             raise HTTPException(409, "Task revision has changed")
 
     validate_filename(filename)
-    data = await read_upload(request)
-    await to_thread.run_sync(validate_workbook, data)
+    try:
+        with fail_after(settings.execution_upload_seconds):
+            data = await read_upload(request)
+            await to_thread.run_sync(validate_workbook, data)
+    except TimeoutError:
+        raise HTTPException(504, "Source upload exceeded its time limit") from None
+    checksum = sha256(data).hexdigest()
+    material = [task_id, expected_revision, filename, checksum, len(data)]
+    receipt_key = ReceiptKey.from_request(operator, "upload_source", idempotency_key, material)
+
+    async def prepare(connection):
+        receipt = await reserve_receipt(connection, receipt_key)
+        if receipt is not None:
+            return TaskDetails.model_validate(receipt), None
+        current = await lock_current_revision(connection, task_id, operator, expected_revision)
+        attempt = await claim(connection, current, operator, "upload_source", material, settings.execution_upload_seconds)
+        return None, attempt
+
+    receipt, attempt = await acquire(engine, prepare)
+    if attempt is None:
+        return receipt
+
     key = f"sources/{task_id}/{uuid4()}.xlsx"
     storage_attempted = False
+    storage = None
     try:
-        async with transaction(engine) as connection:
-            current = await lock_current_revision(connection, task_id, operator, expected_revision)
+        async with executing(engine, attempt):
+            storage = storage_for(request)
+            await register_object(engine, attempt, key)
             storage_attempted = True
-            await to_thread.run_sync(storage.put, key, data)
-            return await append_revision(connection, current, {
-                "status": "source_uploaded",
-                "source_key": key,
-                "source_filename": filename,
-                "source_size": len(data),
-                "source_sha256": sha256(data).hexdigest(),
-            })
-    except SourceAlreadyExists:
-        raise HTTPException(503, "Source storage unavailable") from None
-    except BaseException as error:
-        if storage_attempted:
+            try:
+                await request.app.state.storage_worker.run(storage.put, key, data, write_key=key)
+            except SourceAlreadyExists:
+                storage_attempted = False
+                await forget_colliding_object(engine, attempt, key)
+                raise ExecutionFailure(503, "Source storage unavailable", "storage_collision", retryable=True) from None
+            except StorageError:
+                raise ExecutionFailure(503, "Source storage unavailable", "source_storage_unavailable", retryable=True) from None
+
+            async with transaction(engine) as connection:
+                await reserve_receipt(connection, receipt_key)
+                current = await lock_current_revision(connection, task_id, operator, expected_revision)
+                await fence(connection, attempt)
+                result = await append_revision(connection, current, {
+                    "status": "source_uploaded", "source_key": key, "source_filename": filename,
+                    "source_size": len(data), "source_sha256": checksum,
+                })
+                await save_receipt(connection, receipt_key, result)
+                await settle(connection, attempt, "succeeded", result={"revision": result.revision, "source_sha256": checksum})
+                return result
+    except BaseException:
+        if storage_attempted and key in request.app.state.storage_worker.writes:
+            logger.warning("Source cleanup pending for key %s", key)
+        elif storage_attempted:
             try:
                 with CancelScope(shield=True):
                     await discard_unreferenced(engine, storage, task_id, key)
             except (StorageError, SQLAlchemyError):
                 logger.warning("Source cleanup pending for key %s", key)
-        if isinstance(error, StorageError):
-            raise HTTPException(503, "Source storage unavailable") from None
         raise
 
 

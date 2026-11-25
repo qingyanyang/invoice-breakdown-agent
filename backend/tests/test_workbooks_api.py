@@ -162,10 +162,11 @@ async def test_generation_rechecks_allocation_before_writing(
     complete, release = asyncio.Event(), asyncio.Event()
     render = workbooks.to_process.run_sync
 
-    async def delayed(*args, **kwargs):
-        result = await render(*args, **kwargs)
-        complete.set()
-        await release.wait()
+    async def delayed(function, *args, **kwargs):
+        result = await render(function, *args, **kwargs)
+        if function is workbooks.generate_workbook:
+            complete.set()
+            await release.wait()
         return result
 
     async with service() as client:

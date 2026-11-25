@@ -94,13 +94,13 @@ class LocalSourceStorage:
 
 class AzureSourceStorage:
     def __init__(self, config: Settings, *, container: str | None = None):
-        self.credential = ManagedIdentityCredential(client_id=config.azure_client_id)
+        self.credential = ManagedIdentityCredential(client_id=config.azure_client_id, retry_total=0)
         self.service = BlobServiceClient(
             config.azure_storage_blob_endpoint,
             credential=self.credential,
             connection_timeout=5,
             read_timeout=15,
-            retry_total=1,
+            retry_total=0,
         )
         container_name = config.azure_storage_documents_container if container is None else container
         self.container = self.service.get_container_client(container_name)

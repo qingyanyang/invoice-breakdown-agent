@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 from uuid import UUID, uuid4
 
+from anyio import CancelScope, fail_after
 from fastapi import APIRouter, HTTPException, Request
 from langgraph.types import Command
 from psycopg import Error as PostgresError
@@ -14,10 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from app.checkpoints import open_checkpointer
 from app.config import settings
 from app.database import DatabaseConfigurationError
+from app.execution import acquire, claim, executing, fence, settle
 from app.invoice_graph import (
     GST_BASES, CheckpointStateError, GSTAnswer, InvoiceState, compile_invoice_graph, target_evidence,
 )
 from app.operators import Operator
+from app.request_receipts import ReceiptKey, RequestKey, reserve_receipt, save_receipt
 from app.tasks import database_for, lock_current_revision, owned_revision, transaction
 from app.workflow_tables import revision_workflows, workflow_answers
 
@@ -111,13 +114,34 @@ def checkpoint_inputs(revision) -> InvoiceState:
 
 
 @asynccontextmanager
-async def durable_graph():
+async def durable_graph(revision):
+    thread = checkpoint_config(revision)["configurable"]["thread_id"]
+    lock = f"{settings.postgres_schema}:{thread}"
     try:
-        async with open_checkpointer(settings) as checkpointer:
-            yield compile_invoice_graph(checkpointer)
+        with fail_after(settings.execution_checkpoint_seconds):
+            async with open_checkpointer(settings) as checkpointer:
+                connection = checkpointer.conn
+                # Keep the advisory lock on the checkpointer's autocommit session.
+                # A replacement can claim the task, but it cannot advance this thread
+                # until the previous session has finished or disconnected.
+                await connection.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", (lock,))
+                try:
+                    yield compile_invoice_graph(checkpointer)
+                finally:
+                    with CancelScope(shield=True):
+                        with fail_after(settings.execution_db_timeout_seconds):
+                            await connection.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (lock,))
     except (PostgresError, DatabaseConfigurationError, CheckpointStateError, TimeoutError) as error:
         logger.warning("Workflow checkpoints unavailable: %s", type(error).__name__)
         raise HTTPException(503, "Workflow checkpoint storage unavailable") from None
+
+
+@asynccontextmanager
+async def active_graph(engine, revision, attempt):
+    async with durable_graph(revision) as graph:
+        async with transaction(engine) as connection:
+            await fence(connection, attempt)
+        yield graph
 
 
 def verify_checkpoint(snapshot, inputs: InvoiceState) -> None:
@@ -148,13 +172,13 @@ def verify_ready(snapshot, inputs: InvoiceState, expected_basis: str | None) -> 
         raise CheckpointStateError("Checkpoint is not ready for extraction")
 
 
-async def initialize_workflow(connection: AsyncConnection, revision) -> WorkflowDetails:
+async def initialize_workflow(engine, revision, attempt) -> dict:
     config = checkpoint_config(revision)
     inputs = checkpoint_inputs(revision)
-    async with durable_graph() as graph:
+    async with active_graph(engine, revision, attempt) as graph:
         snapshot = await graph.aget_state(config)
         if not snapshot.interrupts and (snapshot.next or snapshot.tasks):
-            # A saved node write may already be projected into the snapshot with no next node.
+            # A saved node write may be projected into the snapshot before its next checkpoint.
             await graph.ainvoke(None, config=config)
             snapshot = await graph.aget_state(config)
         elif not snapshot.values and not snapshot.interrupts:
@@ -163,25 +187,18 @@ async def initialize_workflow(connection: AsyncConnection, revision) -> Workflow
 
         if snapshot.interrupts:
             verify_pending(snapshot, inputs)
-            fields = {
-                "stage": "awaiting_clarification",
-                "question_id": uuid4(),
+            return {
+                "stage": "awaiting_clarification", "question_id": uuid4(),
                 "question_evidence": target_evidence(inputs),
             }
-        else:
-            verify_ready(snapshot, inputs, inputs["submitted_gst_basis"])
-            fields = {"stage": "ready_for_extraction", "question_id": None}
-    await connection.execute(
-        insert(revision_workflows).values(task_id=revision["task_id"], revision=revision["revision"], **fields)
-    )
-    return workflow_details(revision, await workflow_record(connection, revision))
+        verify_ready(snapshot, inputs, inputs["submitted_gst_basis"])
+        return {"stage": "ready_for_extraction", "question_id": None}
 
 
-async def resume_accepted(connection: AsyncConnection, revision, answer: GSTAnswer) -> WorkflowDetails:
+async def resume_accepted(engine, revision, attempt, answer: GSTAnswer) -> None:
     config = checkpoint_config(revision)
     inputs = checkpoint_inputs(revision)
-    expected_basis = GST_BASES[answer]
-    async with durable_graph() as graph:
+    async with active_graph(engine, revision, attempt) as graph:
         snapshot = await graph.aget_state(config)
         if not snapshot.interrupts and (snapshot.next or snapshot.tasks):
             verify_checkpoint(snapshot, inputs)
@@ -191,38 +208,55 @@ async def resume_accepted(connection: AsyncConnection, revision, answer: GSTAnsw
             verify_pending(snapshot, inputs)
             await graph.ainvoke(Command(resume=answer), config=config)
             snapshot = await graph.aget_state(config)
-        # If graph progress committed before the task status did, only reconcile the status.
-        verify_ready(snapshot, inputs, expected_basis)
-    await connection.execute(
-        update(revision_workflows).where(*revision_filter(revision)).values(stage="ready_for_extraction")
-    )
-    return workflow_details(revision, await workflow_record(connection, revision))
+        # A previously committed checkpoint can satisfy a later application publication.
+        verify_ready(snapshot, inputs, GST_BASES[answer])
 
 
 async def advance_workflow(
     engine: AsyncEngine, task_id: UUID, operator: str, expected_revision: int,
 ) -> WorkflowDetails:
-    # The same task lock protects revision edits, first start, and all checkpoint advancement.
-    async with transaction(engine) as connection:
+    async def prepare(connection):
         revision = await lock_current_revision(connection, task_id, operator, expected_revision)
         if revision["status"] != "source_uploaded" or not revision["source_key"]:
             raise HTTPException(409, "Upload a source before starting the workflow")
-
         record = await workflow_record(connection, revision)
-        if record is None:
-            return await initialize_workflow(connection, revision)
-        if record["stage"] == "awaiting_clarification" and record["answer"] is not None:
-            return await resume_accepted(connection, revision, record["answer"])
+        detail = workflow_details(revision, record)
+        if detail.status not in {"not_started", "answer_accepted"}:
+            return detail, None
+        operation = "checkpoint_start" if record is None else "checkpoint_resume"
+        material = [revision["source_sha256"], detail.question]
+        attempt = await claim(connection, revision, operator, operation, material, settings.execution_checkpoint_seconds)
+        return (revision, record), attempt
 
-        details = workflow_details(revision, record)
-        async with durable_graph() as graph:
-            snapshot = await graph.aget_state(checkpoint_config(revision))
-            inputs = checkpoint_inputs(revision)
-            if details.status == "awaiting_clarification":
-                verify_pending(snapshot, inputs)
+    inputs, attempt = await acquire(engine, prepare)
+    if attempt is None:
+        return inputs
+
+    revision, record = inputs
+    async with executing(engine, attempt):
+        if record is None:
+            fields = await initialize_workflow(engine, revision, attempt)
+        else:
+            await resume_accepted(engine, revision, attempt, record["answer"])
+        async with transaction(engine) as connection:
+            current = await lock_current_revision(connection, task_id, operator, expected_revision)
+            await fence(connection, attempt)
+            latest = await workflow_record(connection, current)
+            if latest != record or current["source_sha256"] != revision["source_sha256"]:
+                raise HTTPException(409, "The workflow inputs have changed")
+            if record is None:
+                await connection.execute(insert(revision_workflows).values(
+                    task_id=task_id, revision=expected_revision, **fields,
+                ))
             else:
-                verify_ready(snapshot, inputs, details.effective_gst_basis)
-        return details
+                await connection.execute(update(revision_workflows).where(*revision_filter(current))
+                                         .values(stage="ready_for_extraction"))
+            result = workflow_details(current, await workflow_record(connection, current))
+            await settle(
+                connection, attempt, "blocked" if result.status == "awaiting_clarification" else "succeeded",
+                result={"status": result.status, "question_id": result.question.id if result.question else None},
+            )
+            return result
 
 
 @router.get("")
@@ -239,28 +273,52 @@ async def start_or_recover(
     return await advance_workflow(database_for(request), task_id, operator, payload.expected_revision)
 
 
+async def pending_question(connection, revision, question_id):
+    record = await workflow_record(connection, revision)
+    if record is None or record["question_id"] != question_id:
+        raise HTTPException(404, "Question not found on this revision")
+    if record["stage"] != "awaiting_clarification" or record["answer"] is not None:
+        raise HTTPException(409, "Question is no longer pending")
+
+
 @router.post("/answers")
 async def answer_question(
-    task_id: UUID, payload: AnswerRequest, request: Request, operator: Operator,
+    task_id: UUID, payload: AnswerRequest, request: Request, operator: Operator, idempotency_key: RequestKey = None,
 ) -> WorkflowDetails:
     engine = database_for(request)
-    # Commit acceptance before advancing the checkpointer. The answer row is the recovery trigger.
+    key = ReceiptKey.from_request(operator, "workflow_answer", idempotency_key, [task_id, payload])
     async with transaction(engine) as connection:
+        if key is not None:
+            await owned_revision(connection, task_id, operator)
+            receipt = await reserve_receipt(connection, key)
+            if receipt is not None:
+                return WorkflowDetails.model_validate(receipt)
         revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
-        record = await workflow_record(connection, revision)
-        if record is None or record["question_id"] != payload.question_id:
-            raise HTTPException(404, "Question not found on this revision")
-        if record["stage"] != "awaiting_clarification" or record["answer"] is not None:
-            raise HTTPException(409, "Question is no longer pending")
-        async with durable_graph() as graph:
-            snapshot = await graph.aget_state(checkpoint_config(revision))
-            verify_pending(snapshot, checkpoint_inputs(revision))
-        accepted = await connection.scalar(
-            postgres_insert(workflow_answers)
-            .values(question_id=payload.question_id, answer=payload.answer)
-            .on_conflict_do_nothing(index_elements=[workflow_answers.c.question_id])
-            .returning(workflow_answers.c.question_id)
-        )
-        if accepted is None:
-            raise HTTPException(409, "Question is no longer pending")
-    return await advance_workflow(engine, task_id, operator, payload.expected_revision)
+        await pending_question(connection, revision, payload.question_id)
+
+    # Verify the checkpoint outside the application transaction, then accept exactly
+    # one answer under the task lock. The durable receipt and accepted answer commit together.
+    async with durable_graph(revision) as graph:
+        snapshot = await graph.aget_state(checkpoint_config(revision))
+        async with transaction(engine) as connection:
+            receipt = await reserve_receipt(connection, key)
+            if receipt is not None:
+                return WorkflowDetails.model_validate(receipt)
+            current = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
+            await pending_question(connection, current, payload.question_id)
+            verify_pending(snapshot, checkpoint_inputs(current))
+            accepted = await connection.scalar(
+                postgres_insert(workflow_answers)
+                .values(question_id=payload.question_id, answer=payload.answer)
+                .on_conflict_do_nothing(index_elements=[workflow_answers.c.question_id])
+                .returning(workflow_answers.c.question_id)
+            )
+            if accepted is None:
+                raise HTTPException(409, "Question is no longer pending")
+            await save_receipt(connection, key, workflow_details(current, await workflow_record(connection, current)))
+
+    result = await advance_workflow(engine, task_id, operator, payload.expected_revision)
+    if key is not None:
+        async with transaction(engine) as connection:
+            await save_receipt(connection, key, result)
+    return result

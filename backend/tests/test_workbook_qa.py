@@ -276,8 +276,12 @@ async def test_delivery_of_exact_candidate_requires_all_owner_checks_and_expires
         assert (await client.post(qa_path + "/visual-review", headers=ALICE, json={
             **approved_input, "candidate_sha256": "f" * 64,
         })).status_code == 409
-        ready = success(await client.post(qa_path + "/visual-review", headers=ALICE, json=approved_input))
+        approval_headers = ALICE | {"Idempotency-Key": "approve-current-preview"}
+        ready = success(await client.post(qa_path + "/visual-review", headers=approval_headers, json=approved_input))
         assert ready["status"] == "ready_for_delivery"
+        assert success(await client.post(qa_path + "/visual-review", headers=approval_headers, json={
+            **approved_input, "sheets": list(reversed(approved_input["sheets"])),
+        })) == ready
         assert ready["delivery_summary"]["最终核对差额"] == "0.00"
         assert all(ready["checks"][name]["status"] == "passed" for name in CHECKS)
         final = await client.get(task + "/delivery/download", headers=ALICE)
@@ -295,7 +299,7 @@ async def test_delivery_of_exact_candidate_requires_all_owner_checks_and_expires
             **START, "target": {"amount": "290.00", "gst_basis": "excluding_gst"},
         }))
         assert (await client.get(task + "/delivery/download", headers=ALICE)).status_code == 409
-        assert (await client.post(qa_path + "/visual-review", headers=ALICE, json=approved_input)).status_code == 409
+        assert (await client.post(qa_path + "/visual-review", headers=approval_headers, json=approved_input)).status_code == 409
 
 
 @pytest.mark.anyio
@@ -334,6 +338,9 @@ async def test_delivery_blocks_changed_recalculated_detail_and_subtotals(
         finance = qa["checks"]["financial_reconciliation"]
         assert finance["status"] == "failed"
         assert finance["locations"] == [{"sheet": "Trade Summary", "cell": ref} for ref in changed]
+        assert success(await client.post(task + "/delivery/qa", headers=ALICE, json={
+            **START, "expected_artifact_id": artifact["artifact_id"],
+        })) == qa
         assert calls == ["calculate"]
         assert (await client.get(task + "/delivery/download", headers=ALICE)).status_code == 409
 

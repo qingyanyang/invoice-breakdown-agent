@@ -163,7 +163,9 @@ HTTP 409 and cannot advance another revision. An accepted answer stays
 recorded even if checkpoint resume is interrupted. After a restart or
 HTTP 503, read the workflow status. If it shows `answer_accepted`, repeat
 `POST /tasks/{id}/workflow` with that revision to resume or reconcile the
-checkpoint. Concurrent recovery requests share the task lock.
+checkpoint. Each checkpoint thread uses a PostgreSQL session advisory
+lock on the checkpointer connection. A replacement worker resumes from
+the saved snapshot after the original session releases that lock.
 
 This workflow stops at `ready_for_extraction`. A missing or unavailable
 checkpoint store returns HTTP 503 from workflow actions. Run the explicit
@@ -492,6 +494,74 @@ When rendering is temporarily unavailable, a retry resumes from the saved
 candidate if the worker identity agrees. A changed worker version or
 image restarts recalculation and rendering. Changes to the workbook,
 candidate, or QA checks require current evidence and owner approval.
+
+## Execution, idempotency and recovery
+
+Run the explicit migration to `0011_execution_reliability` before using
+these routes. Keep the PostgreSQL direct or session-mode connection for
+checkpoint locks. The existing separate checkpoint setup still applies.
+
+Long-running mutation stages claim an execution in PostgreSQL before
+doing work. A claim binds the authorized operator, task revision and
+effective inputs. The lease has its own worker token and increasing
+attempt number. Stages recheck the lease, source identity and applicable
+upstream approvals before publishing. The application result and
+execution outcome commit in one short transaction.
+
+Repeat the same stage POST after a transient failure or process restart.
+The service admits one attempt per request. Equivalent submissions wait
+briefly for an active attempt and can receive HTTP 202 with `Retry-After`.
+An expired lease can be reclaimed within the original execution deadline
+and attempt limit. Exhaustion returns HTTP 503 with a stored failure code.
+Stage failures remain available from the existing stage GETs when a stage
+result was published. Use the owner-only
+`GET /tasks/{id}/executions?revision={revision}` to inspect recent attempts,
+lease and deadline timestamps, why an execution stopped, and the published
+result identifiers. The optional
+revision defaults to the current one. `X-Execution-Id` identifies the
+operation on pending and execution failure responses.
+
+The defaults are three attempts with exponential backoff starting at
+0.5 seconds, a renewable 30-second lease, and a 720-second overall
+deadline. Stage time limits include queueing after a work claim. Limits
+are configurable with the `EXECUTION_*` variables in `.env.example`.
+Storage SDK and model HTTP requests each use one transport attempt for
+a call. Application retries use the recorded budget. The native worker
+keeps its local capacity slot until it exits, including after a request
+timeout. A clarification, rejected input, or failed QA does not schedule
+an automatic retry. The accepted answer starts a new checkpoint phase
+with its own budget, regardless of how long the owner took to answer.
+Visual review is a separate authorized action.
+
+Send an optional `Idempotency-Key` on task creation, upload, target
+updates, reconciliation and allocation changes, clarification answers,
+and visual review. A key is scoped to the operator and operation, can use
+1 to 128 visible ASCII characters, and is stored as a digest. Validated
+payloads, defaults, normalized monetary amounts, and upload byte
+checksums are part of the request fingerprint. Reusing a key with
+different input returns HTTP 409. A successful mutation replays its
+stored receipt, including its original revision where applicable.
+An accepted answer whose checkpoint resume was interrupted replays
+the acceptance receipt. Repeat the workflow POST to recover it.
+Visual approval also requires the current revision and artifact on replay.
+Receipts are retained for the life of the database. Reuse the original
+key for retries and use a different key for a new mutation.
+
+Recovery at each persistence boundary:
+
+| Boundary | Recovery |
+| --- | --- |
+| Application commit succeeded but the response was lost | Replay the original key or repeat the stage with the same current inputs. The receipt or published result is reused. |
+| The answer committed before LangGraph advanced | The workflow shows `answer_accepted`. Repeat the workflow POST on the same revision. |
+| LangGraph wrote nodes or a checkpoint before the application result committed | The next worker checks the saved snapshot and applies any remaining work under the same checkpoint session lock. A completed checkpoint is reconciled into the application record. |
+| Storage wrote an object before the application manifest committed | Object keys belong to one attempt. A replacement uses its own keys. Cleanup checks the attempt and every applicable manifest before removing an unreferenced object. |
+| A QA candidate was stored and a required tool was temporarily unavailable | Retry within the current budget. Reuse the verified candidate when the worker identity agrees, or recalculate and render when it changes. Approval binds to the current candidate and preview. |
+
+An operator can retry orphan cleanup after a crash with
+`python -m app.source_cleanup --execution-id <execution-id>` or pass a
+specific key from the logs. Active attempts and committed references are
+retained. A timed-out native write can finish after the HTTP response.
+Run cleanup again after that write has stopped if a late object remains.
 
 ## Tests
 

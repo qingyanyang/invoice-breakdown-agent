@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +21,20 @@ class Settings(BaseSettings):
     azure_storage_blob_endpoint: str | None = None
     azure_storage_documents_container: str = "documents"
     azure_storage_processed_documents_container: str = "processed-documents"
+
+    execution_max_attempts: int = Field(default=3, ge=1, le=10)
+    execution_retry_base_seconds: float = Field(default=0.5, gt=0, le=30)
+    execution_lease_seconds: float = Field(default=30, ge=1, le=300)
+    execution_deadline_seconds: int = Field(default=720, ge=1, le=3600)
+    execution_duplicate_wait_seconds: float = Field(default=2, ge=0, le=10)
+    execution_db_timeout_seconds: int = Field(default=5, ge=1, le=30)
+    execution_upload_seconds: int = Field(default=45, ge=1, le=600)
+    execution_checkpoint_seconds: int = Field(default=25, ge=1, le=600)
+    execution_extraction_seconds: int = Field(default=25, ge=1, le=600)
+    execution_classification_seconds: int = Field(default=60, ge=1, le=600)
+    execution_rules_seconds: int = Field(default=25, ge=1, le=600)
+    execution_workbook_seconds: int = Field(default=55, ge=1, le=600)
+    execution_qa_seconds: int = Field(default=260, ge=1, le=600)
 
     model_config = SettingsConfigDict(
         env_file=".env",
