@@ -310,10 +310,6 @@ async def test_provider_adapter_handles_result_and_failures(monkeypatch, tmp_pat
     config = Settings(_env_file=None, classification_model="example-model", llm_api_key=SecretStr("example-key"))
     codex = write_codex(tmp_path, monkeypatch)
     skill = write_skill(tmp_path)
-    skill.write_text(skill.read_text().replace(
-        "FF&E maps to Doors.",
-        "FF&E maps to Doors. Historical example from an unrelated project: $98,765.43.",
-    ) + "\n## 20. Historical evaluations\n### Nested case\nA previous bid was $123.45.\n")
     specification = classification_model.read_primary_specification(skill, codex)
     assert specification.supplementary.provenance() == {
         "status": "applied", "version": "2026-10-05",
@@ -335,7 +331,6 @@ async def test_provider_adapter_handles_result_and_failures(monkeypatch, tmp_pat
         assert "Verified synthetic trade rules." in instruction and "Verified synthetic area rules." in instruction
         assert "Omit this" not in instruction
         assert "Historical or unrelated examples" in instruction
-        assert "$98,765.43" not in instruction and "$123.45" not in instruction
         assert "Check evidence." in instruction
         assert "Retrieved passages from the full primary rules" in instruction
         guidance = json.loads(instruction.rsplit("\n", 1)[1])
@@ -363,29 +358,39 @@ async def test_provider_adapter_handles_result_and_failures(monkeypatch, tmp_pat
         assert failure.value.code == ("model_unavailable" if result == "rate_limit" else "invalid_model_proposal")
 
 
-def test_runtime_rules_remove_examples_without_removing_operational_guidance():
-    text = (
-        "## 6. Trade rules\n"
-        "- FF&E maps to Doors. Historical example from another project: $98,765.43.\n"
-        "  The old contract also included credits.\n"
-        "- Do not apply historical examples to this project.\n\n"
-        "Historical example from an unrelated project: $42.00.\n"
-        "More facts from the same unrelated project.\n\n"
-        "Keep this mandatory rule.\n\n"
-        "## 20. Historical evaluations\n"
-        "### Nested case\n"
-        "Some irrelevant commercial terms.\n"
-        "## 11. QA\n"
-        "Verify the current workbook.\n"
-    )
-    assert classification_model.operational_rules(text) == (
-        "## 6. Trade rules\n"
-        "- FF&E maps to Doors.\n"
-        "- Do not apply historical examples to this project.\n\n\n"
-        "Keep this mandatory rule.\n\n"
-        "## 11. QA\n"
-        "Verify the current workbook.\n"
-    )
+@pytest.mark.parametrize("evaluation", [
+    "## 20. Historical evaluations\n### Nested case\nSome irrelevant commercial terms.",
+    "> **Historical sample:** Use a trade selected for another project.",
+    "Our earlier job included FF&E at AUD 98,765.43.",
+    "The imported cash total was 98,765.43.",
+    "The earlier cash total was $98765.43.",
+])
+def test_mixed_runtime_rules_are_rejected_even_with_matching_checksum(tmp_path, evaluation):
+    skill = write_skill(tmp_path)
+    skill.write_text(skill.read_text() + "\n" + evaluation + "\n")
+    digest = hashlib.sha256(skill.read_bytes()).hexdigest()
+    with pytest.raises(classification_model.ClassificationModelError, match="primary_specification_contains_evaluation_data"):
+        classification_model.read_primary_specification(skill, expected_sha256=digest)
+
+
+def test_runtime_rules_preserve_required_financial_instructions(tmp_path):
+    skill = write_skill(tmp_path)
+    skill.write_text(skill.read_text() + (
+        "\nUse the authorized 10% GST rate where applicable. The reconciliation difference must be $0.00.\n"
+        "Use the format `$#,##0.00`. Do not apply historical examples to this project.\n"
+    ))
+    result = classification_model.read_primary_specification(skill)
+    assert result.text == skill.read_text()
+
+
+def test_supplement_with_mixed_evaluation_is_never_included(tmp_path, monkeypatch):
+    codex = write_codex(tmp_path, monkeypatch)
+    codex.write_text(codex.read_text().replace(
+        "Verified synthetic area rules.", "Verified synthetic area rules. The old quote was $98,765.43.",
+    ))
+    monkeypatch.setattr(classification_model, "APPROVED_CODEX_SHA256", hashlib.sha256(codex.read_bytes()).hexdigest())
+    supplement = classification_model.read_supplementary_specification(codex)
+    assert supplement.status == "contains_evaluation_data" and supplement.text is None
 
 
 def test_stored_legacy_proposal_discards_unstructured_rationale():

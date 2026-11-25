@@ -43,6 +43,8 @@ version and checksum.
 
 Use the source workbook and the current request as workflow inputs. Keep these expectations in the verification harness. The workbooks, names and figures are invented. The reconstructed MetLife workbook may be used privately for exploration. Keep the real sample pack outside the repository and its unverified comparison workbook outside fresh-generation inputs. Apply the approved reference above when the sample pack includes draft guidance.
 
+[Historical classification evaluation](evaluation/historical_classification.json) is a test-only set of invented facts. Keep it outside the approved rules files, rule archives and current workbook inputs. The classification tests use it to check that unrelated amounts cannot reach the provider through the rules or be published as a current-project explanation. They also verify that the same amount is valid when supplied by the current reconciled workbook.
+
 ### Reconciliation and protected allocation
 
 `reconciliation.xlsx` has two source sheets, **Trade Summary** and **Notes**.

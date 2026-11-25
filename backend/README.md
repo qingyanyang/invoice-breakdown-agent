@@ -327,14 +327,17 @@ passage map. It selects up to six approved passages from the exact
 verified primary document, using current row descriptions, area labels,
 and reconciled scope cues. Each passage records its document, approved
 version, checksum, section, immutable ID, exact excerpt, and source
-references where the search matched. The service verifies the full pinned
-primary file and supplies all of its operational guidance for every new
-model proposal. Keep historical and evaluation examples in separate
-evaluation fixtures. For older mixed inputs, sections and blocks
-explicitly labelled as historical examples or evaluation material are
-omitted from both the model request and retrieval. If search finds no
-match, encounters a version mismatch, or is unavailable, classification
-uses the same verified operational rules. The execution fingerprint records the primary checksum,
+references where the search matched. The service verifies and loads the full
+pinned operational file for every new model proposal. Historical examples
+live in evaluation fixtures that the application never reads. Keep literal
+project amounts in authorized current workbooks. The operational rules loader
+rejects evaluation blocks and nonzero currency amounts, while preserving
+the approved zero-difference rule and monetary formatting instructions.
+A mixed primary file blocks classification even when its checksum matches.
+A mixed supplement is withheld, and classification blocks if the task
+requires that pinned version. If optional search finds no match, encounters
+a version mismatch, or is unavailable, classification uses the same verified
+operational rules. The execution fingerprint records the primary checksum,
 the supplementary version actually sent, and the retrieval configuration
 version. Current-project scope and amounts still follow the existing
 source evidence and deterministic checks.
@@ -342,9 +345,11 @@ source evidence and deterministic checks.
 The focused retrieval suite tests section relevance, scope and combined
 areas, no match, version isolation, and exclusion of historical example
 amounts. Integration tests use synthetic workbooks, disposable PostgreSQL,
-and a mocked model. They verify that the provider request excludes labelled
-historical facts and that an unexpected free-text project claim is rejected.
-A current authorized amount identical to a historical example is preserved.
+and a mocked model. They verify that mixed rules fail before search or a
+provider request, that the full verified operational rules reach the
+provider, and that an unsupported model claim is rejected before it can be
+stored. A current authorized amount identical to a historical example is
+preserved.
 Real-model behavioral evaluation of rule application and historical-data
 contamination remains unperformed.
 
@@ -353,7 +358,9 @@ Classification carries forward the exact signed amount of each reconciled
 row and keeps a single coverage entry per row. The code checks the model's
 references and trade labels, row coverage and amount conservation.
 The review rationale quotes a cited current source cell and identifies the
-model's proposed trade or request for clarification. An
+model's proposed trade or request for clarification. Cached reports and
+historical receipts omit legacy, model-written rationales. Recorded
+assignments, amounts and owner decisions remain available. An
 owner's answer is recorded as a confirmed interpretation and carries no
 new price. Complete classification reaches `ready_for_allocation`.
 

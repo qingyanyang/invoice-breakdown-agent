@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 from anyio import BrokenWorkerProcess, to_process, to_thread
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -25,7 +25,8 @@ from app.reconciliations import ReconciliationDetails, reconciliation_record, re
 from app.reconciliation_evidence import Reference
 from app.request_receipts import ReceiptKey, RequestKey, save_receipt
 from app.task_rules import (
-    PINNED_SUPPLEMENT_ERRORS, RULE_INPUT_ERRORS, applied_supplementary, load_verified_rules, primary_document,
+    EVALUATION_DATA_ERRORS, PINNED_SUPPLEMENT_ERRORS, RULE_INPUT_ERRORS, applied_supplementary,
+    load_verified_rules, primary_document,
     rule_pin, save_pin,
 )
 from app.tasks import database_for, lock_current_revision, owned_revision, reserve_owned_receipt, transaction
@@ -57,6 +58,18 @@ class ClassificationDetails(BaseModel):
     model: str | None
     decisions: dict
     report: dict
+
+    @field_validator("report")
+    @classmethod
+    def omit_legacy_model_rationales(cls, report):
+        proposals = report.get("model_proposals")
+        if proposals is None or report.get("rationale_origin") == "current_workbook":
+            return report
+        # Reports and historical retry receipts can predate source-grounded
+        # rationales. Their decisions are retained, but free text is unverified.
+        return {**report, "model_proposals": [
+            {name: value for name, value in proposal.items() if name != "reason"} for proposal in proposals
+        ]}
 
 
 async def classification_inputs(
@@ -200,7 +213,11 @@ async def run_classification(
                 retrieval = rule_retrieval.RetrievalResult("unavailable")
             specification = replace(specification, retrieved_rules=retrieval.passages)
             async with request.app.state.classification_limiter:
-                proposal = await classification_model.propose(settings, specification, model_inputs)
+                response = await classification_model.propose(settings, specification, model_inputs)
+            try:
+                proposal = Proposal.model_validate(response)
+            except ValidationError:
+                raise ClassificationModelError("invalid_model_proposal") from None
             report = await to_thread.run_sync(build_classification, evidence, proposal, {}, str(proposal_id))
         except (ClassificationEvidenceError, ClassificationModelError) as error:
             logger.warning("Classification unavailable: %s", error.code)
@@ -249,10 +266,12 @@ def classification_response(result, headers=None):
     if result.status == "failed":
         error = result.report["error"]
         if error in RULE_INPUT_ERRORS:
-            message = (
-                "The pinned supplementary rules are unavailable" if error in PINNED_SUPPLEMENT_ERRORS
-                else "Approved primary rules are unavailable"
-            )
+            if error in EVALUATION_DATA_ERRORS:
+                message = "Move evaluation data out of the operational rules"
+            elif error in PINNED_SUPPLEMENT_ERRORS:
+                message = "The pinned supplementary rules are unavailable"
+            else:
+                message = "Approved primary rules are unavailable"
             raise HTTPException(503, {"code": error, "message": message}, headers=headers)
         raise HTTPException(503, "Classification unavailable. Read the recorded outcome for details.", headers=headers)
     return result

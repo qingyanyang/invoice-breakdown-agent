@@ -1,12 +1,15 @@
 import hashlib
 import json
+from uuid import UUID
 
 import httpx
 import pytest
 from pydantic import SecretStr
+from sqlalchemy import select, update
 
 from app import classification_model, main, rule_retrieval
 from app.checkpoints import setup_checkpoints
+from app.classification_tables import source_classifications
 from app.config import settings
 from test_allocation_api import fixture_model
 from test_classification import write_codex
@@ -14,6 +17,9 @@ from test_classification_api import START, configured_skill, model_answer, ready
 from test_reconciliation import WORKSHEET, source_sheet
 from test_reconciliation_api import ALICE, BOB, FIXTURES, service, success
 from test_workbook_qa import real_engine, visual_request
+
+HISTORICAL_CASE = json.loads((FIXTURES / "evaluation" / "historical_classification.json").read_text(encoding="utf-8"))
+CURRENT_AMOUNTS = [HISTORICAL_CASE["current_amount"], HISTORICAL_CASE["historical_amount"]]
 
 
 def active_rules(monkeypatch, path, *, version=None):
@@ -36,14 +42,11 @@ async def doors_model(_settings, _specification, inputs):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("amount", ["150.00", "98765.43"])
+@pytest.mark.parametrize("amount", CURRENT_AMOUNTS)
 async def test_classification_records_rule_matches_without_importing_historical_amounts(
     task_runtime, configured_skill, monkeypatch, workbook_with, amount,
 ):
-    historical = "Historical example from an unrelated project: FF&E previously cost $98,765.43."
-    configured_skill.write_text(
-        configured_skill.read_text().replace("FF&E maps to Doors.\n", f"FF&E maps to Doors.\n\n{historical}\n"),
-    )
+    historical = HISTORICAL_CASE["historical_reference"]
     digest = active_rules(monkeypatch, configured_skill, version="synthetic-v1")
     seen = []
 
@@ -69,29 +72,31 @@ async def test_classification_records_rule_matches_without_importing_historical_
         assert match["text"] == "FF&E maps to Doors."
         assert match["row_refs"] == ["Trade Summary!D4"]
         assert historical not in seen[0].text
+        assert seen[0].text == configured_skill.read_text()
         assert len(seen[0].retrieved_rules) == 1
         assert success(await client.get(path, headers=ALICE)) == result
         assert (await client.get(f"/tasks/{task_id}/rules", headers=BOB)).status_code == 404
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("amount", ["150.00", "98765.43"])
+@pytest.mark.parametrize("amount", CURRENT_AMOUNTS)
 async def test_provider_cannot_publish_historical_amounts_in_project_rationale(
     task_runtime, configured_skill, monkeypatch, workbook_with, amount,
 ):
-    historical = "Historical example from another project: FF&E cost $98,765.43."
-    configured_skill.write_text(configured_skill.read_text() + "\n" + historical + "\n")
+    historical = HISTORICAL_CASE["historical_reference"]
+    approved_text = configured_skill.read_text()
     active_rules(monkeypatch, configured_skill)
     client_class = httpx.AsyncClient
     submit_unsupported_reason = True
 
     def respond(request):
         messages = json.loads(request.content)["messages"]
+        assert approved_text in messages[0]["content"]
         assert historical not in messages[0]["content"] and "98,765.43" not in messages[0]["content"]
         inputs = json.loads(messages[1]["content"])
         proposal = model_answer(inputs, {row["row"]: "Doors" for row in inputs["rows"]}).model_dump()
         if submit_unsupported_reason:
-            proposal["rows"][0]["reason"] = "This project's FF&E cost was $98,765.43."
+            proposal["rows"][0]["reason"] = HISTORICAL_CASE["unsupported_rationale"]
         return httpx.Response(200, json={"choices": [{
             "finish_reason": "stop", "message": {"content": json.dumps(proposal)},
         }]})
@@ -113,6 +118,84 @@ async def test_provider_cannot_publish_historical_amounts_in_project_rationale(
         assert classified["status"] == "ready_for_allocation" and classified["report"]["classified_total"] == amount
         review, = classified["report"]["model_proposals"]
         assert review["reason"] == "The model proposed Doors from Trade Summary!A4: FF&E door hardware"
+        assert classified["report"]["rationale_origin"] == "current_workbook"
+
+
+@pytest.mark.anyio
+async def test_mixed_rules_are_blocked_before_search_or_the_model(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    approved_text = configured_skill.read_text()
+    configured_skill.write_text(approved_text + "\n" + HISTORICAL_CASE["historical_reference"] + "\n")
+    active_rules(monkeypatch, configured_skill)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Mixed runtime rules must be rejected before search or a model request")
+
+    monkeypatch.setattr(rule_retrieval, "search_rules", unexpected)
+    monkeypatch.setattr(classification_model, "propose", unexpected)
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, doors_source(workbook_with))
+        path = f"/tasks/{task_id}"
+        mixed = await client.post(path + "/classification", headers=ALICE, json=START)
+        assert mixed.status_code == 503
+        assert mixed.json()["detail"]["code"] == "primary_specification_contains_evaluation_data"
+        failure = success(await client.get(path + "/classification", headers=ALICE))
+        assert failure["report"]["rule_context"]["retrieval"]["status"] == "not_performed"
+        assert not failure["report"]["assignments"]
+        assert success(await client.get(path + "/rules", headers=ALICE)) is None
+
+
+@pytest.mark.anyio
+async def test_classification_boundary_rejects_mocked_adapter_claim_and_persists_no_proposal(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    async def invalid_adapter(config, specification, inputs):
+        proposal = (await doors_model(config, specification, inputs)).model_dump()
+        proposal["rows"][0]["reason"] = HISTORICAL_CASE["unsupported_rationale"]
+        return proposal
+
+    monkeypatch.setattr(classification_model, "propose", invalid_adapter)
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, doors_source(workbook_with))
+        path = f"/tasks/{task_id}/classification"
+        assert (await client.post(path, headers=ALICE, json=START)).status_code == 503
+        async with main.app.state.database_engine.connect() as connection:
+            saved = (await connection.execute(select(source_classifications).where(
+                source_classifications.c.task_id == UUID(task_id),
+            ))).mappings().one()
+        assert saved["status"] == "failed" and saved["proposal"] is None
+        assert saved["report"]["error"] == "invalid_model_proposal"
+        assert HISTORICAL_CASE["unsupported_rationale"] not in json.dumps(saved["report"])
+
+
+@pytest.mark.anyio
+async def test_cached_legacy_classification_does_not_serve_unsupported_model_facts(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    monkeypatch.setattr(classification_model, "propose", doors_model)
+    await setup_checkpoints(settings)
+    async with service() as client:
+        task_id, _ = await ready_task(client, doors_source(workbook_with))
+        path = f"/tasks/{task_id}/classification"
+        current = success(await client.post(path, headers=ALICE, json=START))
+        legacy_report = current["report"]
+        legacy_report.pop("rationale_origin")
+        legacy_report["model_proposals"][0]["reason"] = HISTORICAL_CASE["unsupported_rationale"]
+        async with main.app.state.database_engine.begin() as connection:
+            await connection.execute(update(source_classifications).where(
+                source_classifications.c.task_id == UUID(task_id),
+            ).values(report=legacy_report))
+
+    async with service() as client:
+        cached = success(await client.get(path, headers=ALICE))
+        assert cached == success(await client.post(path, headers=ALICE, json=START))
+        assert cached["proposal_id"] == current["proposal_id"]
+        assert cached["report"]["classified_total"] == "150.00"
+        assert "reason" not in cached["report"]["model_proposals"][0]
+        assert HISTORICAL_CASE["unsupported_rationale"] not in json.dumps(cached)
 
 
 @pytest.mark.anyio

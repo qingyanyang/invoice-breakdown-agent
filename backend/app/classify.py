@@ -27,7 +27,7 @@ class Trade(StrEnum):
 
 
 class RowProposal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     row: str = Field(min_length=1, max_length=255)
     trade: Trade | None
@@ -37,7 +37,7 @@ class RowProposal(BaseModel):
 
 
 class Proposal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     rows: list[RowProposal] = Field(max_length=300)
 
@@ -152,7 +152,8 @@ class ClassificationRun:
 
         return {
             "status": status, "error": None, "questions": self.questions, "assignments": self.assignments,
-            "row_coverage": coverage, "model_proposals": model_reviews, "gst_basis": self.evidence.gst_basis,
+            "row_coverage": coverage, "model_proposals": model_reviews, "rationale_origin": "current_workbook",
+            "gst_basis": self.evidence.gst_basis,
             "working_scope_total": format(self.evidence.total, "f"),
             "classified_total_exact": format(total, "f") if total is not None else None,
             "classified_total": format(cents(total), "f") if total is not None else None,

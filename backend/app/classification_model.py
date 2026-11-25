@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -15,21 +16,27 @@ from app.rule_retrieval import RetrievedRule
 
 MAX_SKILL_BYTES = 64 * 1024
 MAX_INPUT_BYTES = 192 * 1024
-MODEL_CONTRACT_VERSION = "source-citations-v1"
+MODEL_CONTRACT_VERSION = "source-citations-v2"
 # Registered by the business owner in tests/fixtures/invoice_breakdown/README.md.
 APPROVED_CODEX_VERSION = "2026-10-05"
 APPROVED_CODEX_SHA256 = "28a43a6165cbdc62820251fdc969234da8cbd31e0d147151f0f1960f550a98a4"
 EVALUATION_LABEL = (
-    r"(?:(?:historical|past|previous|unrelated)(?:[- ]project)?[- ](?:examples?|cases?|evaluations?|fixtures?)"
+    r"(?:(?:historical|past|previous|unrelated)(?:[- ]project)?[- ](?:examples?|samples?|cases?|evaluations?|fixtures?)"
     r"|evaluation[- ](?:examples?|fixtures?|corpus|material)|历史(?:项目)?(?:示例|案例|评估))"
 )
-HEADING = re.compile(r"^(#{1,6})[ \t]+(?:\d+[.)]\s+)?(.*)")
-EVALUATION_HEADING = re.compile(rf"^{EVALUATION_LABEL}(?=\b|[:：]|$)", re.IGNORECASE)
-EVALUATION_PARAGRAPH = re.compile(
-    rf"^[ \t]*(?:(?:[-*+] |\d+[.)] ))?(?:\*\*)?{EVALUATION_LABEL}[^:\n：]*[:：]", re.IGNORECASE,
+EVALUATION_BLOCK = re.compile(
+    rf"(?:^\s*\#{{1,6}}\s+(?:\d+[.)]\s+)?{EVALUATION_LABEL}(?=\b|[:：]|$)"
+    rf"|(?:^[ \t]*(?:[>-]\s*)*|(?<=[.!?] ))(?:\*\*)?{EVALUATION_LABEL}[^:\n：]*[:：])",
+    re.IGNORECASE | re.MULTILINE,
 )
-INLINE_EVALUATION = re.compile(rf"(?<=[.!?] ){EVALUATION_LABEL}[^:\n：]*[:：]", re.IGNORECASE)
-LIST_ITEM = re.compile(r"^[ \t]*(?:[-*+] |\d+[.)] )")
+MONEY_VALUE = r"(?:\d{1,3}(?:[,\u00a0 ]\d{3})+|\d+)(?:\.\d{1,2})?"
+CURRENCY = r"(?:[$€£¥]|\b(?:AUD|USD|NZD|CAD|EUR|GBP)\b)"
+PROJECT_AMOUNT = re.compile(
+    rf"{CURRENCY}[ \t]*[+−-]?(?P<prefix>{MONEY_VALUE})(?!\d|[.,]\d)"
+    rf"|(?P<suffix>{MONEY_VALUE})[ \t]*{CURRENCY}"
+    r"|(?P<grouped>\b\d{1,3}(?:[,\u00a0 ]\d{3})+\.\d{2})(?!\d)",
+    re.IGNORECASE,
+)
 INSTRUCTIONS = """
 Propose trade assignments for the reconciled working-scope rows using the primary
 SKILL.md included below. Apply sections 6–7, with the relevant scope and QA rules.
@@ -73,32 +80,18 @@ class SupplementarySpecification:
         }
 
 
-def operational_rules(text: str) -> str:
-    """Keep operational guidance and remove explicitly labelled evaluation material."""
-    lines = []
-    hidden_section = None
-    hidden_paragraph = False
-    for line in text.splitlines(keepends=True):
-        if heading := HEADING.match(line):
-            depth = len(heading[1])
-            if hidden_section is not None and depth > hidden_section:
-                continue
-            hidden_paragraph = False
-            hidden_section = depth if EVALUATION_HEADING.match(heading[2]) else None
-        if hidden_section is not None:
-            continue
-        if not line.strip() or LIST_ITEM.match(line):
-            hidden_paragraph = False
-        if EVALUATION_PARAGRAPH.match(line):
-            hidden_paragraph = True
-        if hidden_paragraph:
-            continue
-        if example := INLINE_EVALUATION.search(line):
-            lines.append(line[:example.start()].rstrip() + "\n")
-            hidden_paragraph = True
-        else:
-            lines.append(line)
-    return "".join(lines)
+def contains_evaluation_data(text: str) -> bool:
+    """Detect mixed rule inputs without rewriting approved operating guidance."""
+    if EVALUATION_BLOCK.search(text):
+        return True
+    # Allow the required zero-difference check. Current project amounts are
+    # supplied through workbook evidence and do not belong in this corpus.
+    for amount in PROJECT_AMOUNT.finditer(text):
+        value = next(group for group in amount.groups() if group is not None)
+        value = re.sub(r"[,\u00a0 ]", "", value)
+        if not Decimal(value).is_zero():
+            return True
+    return False
 
 
 def read_supplementary_specification(
@@ -125,7 +118,10 @@ def read_supplementary_specification(
     sections = re.search(r"(?ms)(^## 四、.*?^## 五、.*?)^## 六、", text)
     if sections is None:
         return SupplementarySpecification("sections_unavailable")
-    return SupplementarySpecification("applied", operational_rules(sections[1]).strip(), version, sha256)
+    operational = sections[1].strip()
+    if contains_evaluation_data(operational):
+        return SupplementarySpecification("contains_evaluation_data")
+    return SupplementarySpecification("applied", operational, version, sha256)
 
 
 @dataclass(frozen=True)
@@ -136,21 +132,28 @@ class PrimarySpecification:
     retrieved_rules: tuple[RetrievedRule, ...] = ()
 
 
-def read_primary_specification(path: Path | None, codex_path: Path | None = None) -> PrimarySpecification:
+def read_primary_specification(
+    path: Path | None, codex_path: Path | None = None, *, expected_sha256: str | None = None,
+) -> PrimarySpecification:
     try:
         if path is None or path.name != "SKILL.md" or not path.is_file():
             raise ValueError
         with path.open("rb") as source:
             content = source.read(MAX_SKILL_BYTES + 1)
-        text = operational_rules(content.decode("utf-8-sig"))
+        text = content.decode("utf-8-sig")
         if len(content) > MAX_SKILL_BYTES or any(
             not re.search(rf"^## {section}\.", text, re.MULTILINE) for section in (6, 7, 8, 11)
         ):
             raise ValueError
     except (OSError, ValueError):
         raise ClassificationModelError("primary_specification_unavailable") from None
+    actual_sha256 = hashlib.sha256(content).hexdigest()
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise ClassificationModelError("primary_specification_mismatch")
+    if contains_evaluation_data(text):
+        raise ClassificationModelError("primary_specification_contains_evaluation_data")
     return PrimarySpecification(
-        text, hashlib.sha256(content).hexdigest(), read_supplementary_specification(codex_path),
+        text, actual_sha256, read_supplementary_specification(codex_path),
     )
 
 

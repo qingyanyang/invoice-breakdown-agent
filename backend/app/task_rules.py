@@ -24,8 +24,13 @@ from app.tasks import (
 from app.workflows import RevisionRequest
 
 router = APIRouter(prefix="/tasks/{task_id}/rules", tags=["approved rules"])
-PINNED_SUPPLEMENT_ERRORS = {"pinned_supplementary_unavailable", "pinned_supplementary_mismatch"}
-RULE_INPUT_ERRORS = PINNED_SUPPLEMENT_ERRORS | {"primary_specification_mismatch", "primary_specification_unavailable"}
+PINNED_SUPPLEMENT_ERRORS = {
+    "pinned_supplementary_unavailable", "pinned_supplementary_mismatch", "pinned_supplementary_contains_evaluation_data",
+}
+EVALUATION_DATA_ERRORS = {"primary_specification_contains_evaluation_data", "pinned_supplementary_contains_evaluation_data"}
+RULE_INPUT_ERRORS = PINNED_SUPPLEMENT_ERRORS | EVALUATION_DATA_ERRORS | {
+    "primary_specification_mismatch", "primary_specification_unavailable",
+}
 
 
 @dataclass(frozen=True)
@@ -61,30 +66,33 @@ def archived_rule(config: Settings, document: RuleDocument) -> Path | None:
 
 
 def read_pinned_supplement(config: Settings, document: RuleDocument) -> classification_model.SupplementarySpecification:
-    mismatch = False
+    rejected = set()
     for path in (config.classification_codex_path, archived_rule(config, document)):
         supplement = classification_model.read_supplementary_specification(
             path, version=document.version, sha256=document.sha256,
         )
         if supplement.status == "applied":
             return supplement
-        mismatch |= supplement.status == "checksum_mismatch"
-    code = "pinned_supplementary_mismatch" if mismatch else "pinned_supplementary_unavailable"
+        rejected.add(supplement.status)
+    if "contains_evaluation_data" in rejected:
+        code = "pinned_supplementary_contains_evaluation_data"
+    elif "checksum_mismatch" in rejected:
+        code = "pinned_supplementary_mismatch"
+    else:
+        code = "pinned_supplementary_unavailable"
     raise classification_model.ClassificationModelError(code)
 
 
 def read_verified_rules(config: Settings, pin: RulePin | None) -> VerifiedRules:
     expected = pin.primary if pin else primary_document(config.classification_skill_sha256, config.classification_skill_version)
-    mismatch = False
+    rejected = set()
     for path in (config.classification_skill_path, archived_rule(config, expected) if pin else None):
         if path is None:
             continue
         try:
-            specification = classification_model.read_primary_specification(path)
-        except classification_model.ClassificationModelError:
-            continue
-        if specification.sha256 != expected.sha256:
-            mismatch = True
+            specification = classification_model.read_primary_specification(path, expected_sha256=expected.sha256)
+        except classification_model.ClassificationModelError as error:
+            rejected.add(error.code)
             continue
 
         if pin is None:
@@ -97,7 +105,9 @@ def read_verified_rules(config: Settings, pin: RulePin | None) -> VerifiedRules:
         specification = replace(specification, supplementary=supplement)
         return VerifiedRules(pin or RulePin(expected, applied_supplementary(specification)), specification)
 
-    code = "primary_specification_mismatch" if mismatch else "primary_specification_unavailable"
+    code = next((error for error in (
+        "primary_specification_contains_evaluation_data", "primary_specification_mismatch",
+    ) if error in rejected), "primary_specification_unavailable")
     raise classification_model.ClassificationModelError(code)
 
 
@@ -202,7 +212,10 @@ async def upgrade_rules(
     try:
         verified = await load_verified_rules(request, None)
     except classification_model.ClassificationModelError as error:
-        raise HTTPException(503, {"code": error.code, "message": "Approved primary rules are unavailable"}) from None
+        message = "Move evaluation data out of the primary rules" if error.code in EVALUATION_DATA_ERRORS else (
+            "Approved primary rules are unavailable"
+        )
+        raise HTTPException(503, {"code": error.code, "message": message}) from None
 
     selected = verified.pin
     if declares_supplement:
