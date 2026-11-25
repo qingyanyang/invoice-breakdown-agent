@@ -7,7 +7,7 @@ import pytest
 from openpyxl import load_workbook
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import classification_model, main, workbooks
+from app import classification_model, main, source_cleanup, workbooks
 from app.checkpoints import setup_checkpoints
 from app.config import settings
 from app.source_storage import StorageError
@@ -66,15 +66,15 @@ async def test_concurrent_generation_publishes_one_version_and_preserves_source(
         unchanged = await client.get(task + "/source", headers=ALICE)
         assert unchanged.content == source
 
-        monkeypatch.setattr(workbooks, "TEMPLATE_VERSION", "2")
+        monkeypatch.setattr(workbooks, "TEMPLATE_VERSION", "test-template-next")
         assert (await client.get(path, headers=ALICE)).status_code == 404
         new = success(await client.post(path, headers=ALICE, json=request))
-        assert new["template_version"] == "2" and new["version"] == 2
+        assert new["template_version"] == "test-template-next" and new["version"] == 2
         assert new["artifact_id"] != artifact["artifact_id"]
         assert old.read_bytes() == download.content
-        monkeypatch.setattr(workbooks, "GENERATOR_VERSION", "2")
+        monkeypatch.setattr(workbooks, "GENERATOR_VERSION", "test-generator-next")
         regenerated = success(await client.post(path, headers=ALICE, json=request))
-        assert regenerated["generator_version"] == "2" and regenerated["version"] == 3
+        assert regenerated["generator_version"] == "test-generator-next" and regenerated["version"] == 3
         assert len(list((task_runtime / "outputs").rglob("*.xlsx"))) == 3
 
 
@@ -188,3 +188,99 @@ async def test_generation_rechecks_allocation_before_writing(
         assert response.status_code == 409
         assert (await client.get(path, headers=ALICE)).status_code == 404
         assert not list((task_runtime / "outputs").rglob("*.xlsx"))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["missing", "corrupt"])
+async def test_concurrent_retry_repairs_unavailable_workbook_without_overwriting_versions(
+    task_runtime, configured_skill, monkeypatch, workbook_with, failure,
+):
+    monkeypatch.setattr(classification_model, "propose", misc_model)
+    await setup_checkpoints(settings)
+    source = allocation_workbook(workbook_with, [("Miscellaneous work", "20.00", "Area A")])
+    async with service() as client:
+        path, request = await ready_allocation(client, source)
+        original = success(await client.post(path, headers=ALICE, json=request))
+        old, = (task_runtime / "outputs").rglob("*.xlsx")
+        if failure == "missing":
+            old.unlink()
+        else:
+            old.write_bytes(b"corrupt contents")
+        assert (await client.get(path + "/download", headers=ALICE)).status_code == 503
+
+        responses = await asyncio.gather(*[client.post(path, headers=ALICE, json=request) for _ in range(2)])
+        repaired, repeat = [success(response) for response in responses]
+        assert repaired == repeat
+        assert repaired["version"] == original["version"] + 1
+        assert repaired["artifact_id"] != original["artifact_id"]
+        assert repaired["status"] == "generated_awaiting_qa"
+        download = await client.get(path + "/download", headers=ALICE)
+        assert download.status_code == 200
+        assert sha256(download.content).hexdigest() == repaired["sha256"]
+        assert success(await client.post(path, headers=ALICE, json=request)) == repaired
+        assert await source_cleanup.cleanup(old.relative_to(task_runtime).as_posix()) is False
+        if failure == "missing":
+            assert not old.exists()
+        else:
+            assert old.read_bytes() == b"corrupt contents"
+
+
+@pytest.mark.anyio
+async def test_transient_storage_failure_does_not_start_a_repair(
+    task_runtime, configured_skill, monkeypatch, workbook_with,
+):
+    monkeypatch.setattr(classification_model, "propose", misc_model)
+    await setup_checkpoints(settings)
+    source = allocation_workbook(workbook_with, [("Miscellaneous work", "20.00", "Area A")])
+    async with service() as client:
+        path, request = await ready_allocation(client, source)
+        original = success(await client.post(path, headers=ALICE, json=request))
+
+        def unavailable(*_args):
+            raise StorageError("simulated temporary failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(main.app.state.output_storage, "read", unavailable)
+            assert (await client.post(path, headers=ALICE, json=request)).status_code == 503
+        assert success(await client.post(path, headers=ALICE, json=request)) == original
+        assert len(list((task_runtime / "outputs").rglob("*.xlsx"))) == 1
+
+
+@pytest.mark.anyio
+async def test_deferred_output_cleanup_handles_orphans_and_staging_but_preserves_manifest(
+    task_runtime, configured_skill, monkeypatch, workbook_with, caplog,
+):
+    monkeypatch.setattr(classification_model, "propose", misc_model)
+    await setup_checkpoints(settings)
+    source = allocation_workbook(workbook_with, [("Miscellaneous work", "20.00", "Area A")])
+    async with service() as client:
+        path, request = await ready_allocation(client, source)
+        storage = main.app.state.output_storage
+        put = storage.put
+
+        def partial(key, data):
+            put(key, data[:12])
+            raise StorageError("simulated partial write")
+
+        def deletion_failure(_key):
+            raise StorageError("simulated deletion failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(storage, "put", partial)
+            patch.setattr(storage, "delete", deletion_failure)
+            assert (await client.post(path, headers=ALICE, json=request)).status_code == 503
+        orphan, = (task_runtime / "outputs").rglob("*.xlsx")
+        orphan_key = orphan.relative_to(task_runtime).as_posix()
+        assert f"Workbook cleanup pending for key {orphan_key}" in caplog.text
+        assert (await client.get(path + "/download", headers=ALICE)).status_code == 404
+        assert await source_cleanup.cleanup(orphan_key) is True
+        assert not orphan.exists()
+
+        ready = success(await client.post(path, headers=ALICE, json=request))
+        artifact, = (task_runtime / "outputs").rglob("*.xlsx")
+        staging = artifact.with_name(f".{ready['artifact_id']}.testing01.staging")
+        staging.write_bytes(b"staging contents")
+        assert await source_cleanup.cleanup(staging.relative_to(task_runtime).as_posix()) is True
+        assert not staging.exists()
+        assert await source_cleanup.cleanup(artifact.relative_to(task_runtime).as_posix()) is False
+        assert (await client.get(path + "/download", headers=ALICE)).content == artifact.read_bytes()

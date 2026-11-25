@@ -17,7 +17,7 @@ from app.workbook_layout import (
 from app.workbook_source import SourcePackage, WorkbookProblem
 from app.workbook_upload import validate_workbook
 
-GENERATOR_VERSION = "1"
+GENERATOR_VERSION = "2"
 REVIEW_STATUS = "generated_awaiting_qa"
 
 

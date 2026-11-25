@@ -5,6 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from itertools import zip_longest
 from math import ceil
 
 from lxml import etree as xml
@@ -17,7 +18,8 @@ from app.workbook_source import MAIN, S, XML_SPACE, WorkbookProblem, parse, seri
 SUMMARY = "Invoice Breakdown"
 ADJUSTMENT = "Adjustment Detail"
 EVIDENCE = "Source Evidence"
-TEMPLATE_VERSION = "1"
+TEMPLATE_VERSION = "2"
+EVIDENCE_LINES_PER_ROW = 24
 MONEY = "$#,##0.00"
 DATE = "dd/mm/yyyy"
 NOT_STATED = "Not stated in source"
@@ -352,8 +354,38 @@ def adjustment_sheet(styles, report, reconciliation, summary_total_row):
     return sheet
 
 
+def evidence_fragments(value: str, width: int):
+    """Split while preserving all original characters, including newlines."""
+    start = occupied = 0
+    lines = 1
+    for index, char in enumerate(value):
+        if char == "\n" or occupied == width:
+            if lines == EVIDENCE_LINES_PER_ROW:
+                yield value[start:index]
+                start = index
+                lines = 2 if char == "\n" else 1
+            else:
+                lines += 1
+            occupied = 0
+            if char == "\n":
+                continue
+        occupied += 1
+    yield value[start:]
+
+
+def evidence_rows(sheet: Worksheet, values: tuple, split_columns: tuple[int, ...]) -> None:
+    fragments = list(zip_longest(*(
+        evidence_fragments(values[column], sheet.widths[column] - 2) for column in split_columns
+    )))
+    for part, cells in enumerate(fragments, 1):
+        row = list(values)
+        for column, value in zip(split_columns, cells):
+            row[column] = value
+        sheet.row(*row, f"{part}/{len(fragments)}" if len(fragments) > 1 else None)
+
+
 def evidence_sheet(styles, package, metadata_evidence):
-    sheet = Worksheet(EVIDENCE, styles, (26, 28, 20, 18, 65, 24, 24, 28))
+    sheet = Worksheet(EVIDENCE, styles, (26, 28, 20, 18, 65, 24, 24, 28, 12))
     sheet.row(Cell(EVIDENCE, "title"))
     sheet.row("Source sheets in original order. Saved results retain their original verification status.")
     sheet.row(*(Cell(value, "heading") for value in ("Source sheet", "Copied tab", "Visibility")))
@@ -368,17 +400,17 @@ def evidence_sheet(styles, package, metadata_evidence):
         sheet.row()
         sheet.row(*(Cell(value, "heading") for value in (
             "Source sheet", "Copied tab", "Cell", "Formula anchor", "Original formula",
-            "Saved value", "Cache status", "Handling",
+            "Saved value", "Cache status", "Handling", "Part",
         )))
         for item in package.formulas:
-            sheet.row(*item)
+            evidence_rows(sheet, item, (4, 5))
     if package.names or package.links:
         sheet.row()
         sheet.row(*(Cell(value, "heading") for value in (
-            "Scope", "Cell or name", "Handling", "", "Original reference", "Display text", "Tooltip",
+            "Scope", "Cell or name", "Handling", "", "Original reference", "Display text", "Tooltip", "", "Part",
         )))
         for source, ref, text in package.names:
-            sheet.row(source, ref, "Named range snapshot", None, text)
+            evidence_rows(sheet, (source, ref, "Named range snapshot", None, text, None, None, None), (4,))
         for source, ref, text, display, tooltip in package.links:
-            sheet.row(source, ref, "Link snapshot", None, text, display, tooltip)
+            evidence_rows(sheet, (source, ref, "Link snapshot", None, text, display, tooltip, None), (4, 5, 6))
     return sheet

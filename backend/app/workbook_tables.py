@@ -1,4 +1,4 @@
-from sqlalchemy import CheckConstraint, Column, ForeignKeyConstraint, Integer, String, Table, UniqueConstraint, Uuid
+from sqlalchemy import CheckConstraint, Column, ForeignKeyConstraint, Index, Integer, String, Table, UniqueConstraint, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.database import metadata
@@ -21,9 +21,9 @@ workbook_artifacts = Table(
     Column("report", JSONB, nullable=False),
     ForeignKeyConstraint(["task_id", "revision"], ["task_revisions.task_id", "task_revisions.revision"]),
     UniqueConstraint("task_id", "version", name="uq_workbook_artifact_version"),
-    UniqueConstraint(
-        "task_id", "revision", "source_sha256", "allocation_id", "generator_version", "template_version",
-        name="uq_workbook_artifact_inputs",
+    Index(
+        "ix_workbook_artifact_inputs",
+        "task_id", "revision", "source_sha256", "allocation_id", "generator_version", "template_version", "version",
     ),
     CheckConstraint("version > 0 AND size > 0", name="ck_workbook_artifact_size_version"),
 )

@@ -26,6 +26,10 @@ class SourceIntegrityError(StorageError):
     pass
 
 
+class StorageNotFound(StorageError):
+    pass
+
+
 class SourceStorage(Protocol):
     def put(self, key: str, data: bytes) -> None: ...
     def read(self, key: str, size: int) -> bytes: ...
@@ -64,7 +68,8 @@ class LocalSourceStorage:
                     temporary.unlink(missing_ok=True)
                 except OSError:
                     logger.warning(
-                        "Source staging cleanup pending for key %s",
+                        "%s staging cleanup pending for key %s",
+                        "Workbook" if key.startswith("outputs/") else "Source",
                         (destination.parent.relative_to(self.directory) / temporary.name).as_posix(),
                     )
 
@@ -72,6 +77,8 @@ class LocalSourceStorage:
         try:
             with (self.directory / key).open("rb") as handle:
                 return handle.read(size + 1)
+        except FileNotFoundError:
+            raise StorageNotFound from None
         except OSError:
             raise StorageError from None
 
@@ -109,6 +116,8 @@ class AzureSourceStorage:
     def read(self, key: str, size: int) -> bytes:
         try:
             return self.container.download_blob(key, offset=0, length=size + 1).readall()
+        except ResourceNotFoundError:
+            raise StorageNotFound from None
         except AzureError:
             raise StorageError from None
 

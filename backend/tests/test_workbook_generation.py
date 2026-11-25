@@ -28,7 +28,7 @@ def source_parts():
     with ZipFile(FIXTURES / "reconciliation.xlsx") as file:
         return {
             name: ElementTree.fromstring(file.read(name))
-            for name in ("xl/workbook.xml", "xl/_rels/workbook.xml.rels", "[Content_Types].xml")
+            for name in ("xl/workbook.xml", "xl/_rels/workbook.xml.rels", "[Content_Types].xml", "xl/styles.xml")
         }
 
 
@@ -137,6 +137,9 @@ def varied_source(workbook_with):
         content, f"{{{CT_NS}}}Override", PartName="/xl/comments1.xml",
         ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml",
     )
+    formats = ElementTree.SubElement(parts["xl/styles.xml"], NS + "dxfs", count="1")
+    font = ElementTree.SubElement(ElementTree.SubElement(formats, NS + "dxf"), NS + "font")
+    ElementTree.SubElement(font, NS + "color", rgb="FF9C0006")
     parts = {name: ElementTree.tostring(root) for name, root in parts.items()}
     parts[NOTES] = f"""
 <worksheet xmlns="{SHEET_NS}" xmlns:r="{REL_NS}">
@@ -149,6 +152,8 @@ def varied_source(workbook_with):
 <c r="B2"><f>OldName</f></c><c r="C2"><f>C1</f><v>11</v></c>
 <c r="D2"><f>'Trade Summary'!D12</f><v>260</v></c>
 <c r="E2" t="inlineStr"><is><t>=HYPERLINK("unsafe","text")</t></is></c>
+<c r="F2" t="str"><f>IF(1=1,"","Text")</f><v/></c>
+<c r="G2" t="str"><f>IF(1=1,"","Text")</f></c>
 </row>
 <row r="3">
 <c r="A3" t="inlineStr"><is><t>Start Date</t></is></c>
@@ -159,6 +164,8 @@ def varied_source(workbook_with):
 <row r="5"><c r="A5" t="inlineStr"><is><t>Original note and exclusions</t></is></c></row>
 </sheetData>
 <mergeCells count="1"><mergeCell ref="A5:D5"/></mergeCells>
+<conditionalFormatting sqref="A1"><cfRule type="cellIs" operator="greaterThan" priority="1" dxfId="0">
+<formula>0</formula></cfRule></conditionalFormatting>
 <hyperlinks><hyperlink ref="A5" r:id="rLink" display="Old source" tooltip="Original workbook"/></hyperlinks>
 <legacyDrawing r:id="rVml"/>
 </worksheet>""".encode()
@@ -197,6 +204,11 @@ def test_source_content_links_formulas_and_hidden_structure_survive_as_evidence(
     assert copied["C2"].value == "=C1"
     assert copied["D2"].value == 260
     assert copied["E2"].data_type == "s"
+    assert copied["F2"].value == "" and copied["F2"].data_type == "s"
+    assert copied["G2"].value is None
+    rule, = copied.conditional_formatting["A1"]
+    assert (rule.type, rule.operator, rule.formula) == ("cellIs", "greaterThan", ["0"])
+    assert rule.dxf.font.color.rgb == "FF9C0006"
     assert (copied["C3"].value, copied["C4"].value) == (3, 4)
     assert copied["A5"].hyperlink is None
     assert "OldName" not in book.defined_names
@@ -207,6 +219,10 @@ def test_source_content_links_formulas_and_hidden_structure_survive_as_evidence(
     evidence = list(book["Source Evidence"].values)
     missing = next(row for row in evidence if row[2] == "B2")
     assert missing[4:8] == ("OldName", "", "missing", "Source snapshot")
+    blank = next(row for row in evidence if row[2] == "F2")
+    assert blank[4:8] == ('IF(1=1,"","Text")', "", "saved_unverified", "Source snapshot")
+    uncached = next(row for row in evidence if row[2] == "G2")
+    assert uncached[4:8] == ('IF(1=1,"","Text")', "", "missing", "Source snapshot")
     external = next(row for row in evidence if row[2] == "A2")
     assert external[4:8] == ("'[1]Remote'!A1", "Saved text", "saved_unverified", "Source snapshot")
     follower = next(row for row in evidence if row[2] == "C4")
@@ -234,3 +250,36 @@ def test_unsupported_source_feature_reports_the_affected_sheet(workbook_with):
     assert failed.value.code == "unsupported_source_feature"
     assert failed.value.sheet == "Notes"
     assert failed.value.feature == "drawing"
+
+
+def test_long_formula_evidence_continues_with_repeated_source_locations(workbook_with):
+    formula = "CONCATENATE(" + ",".join(f'"{part:02d}' + "x" * 97 + '"' for part in range(30)) + ")"
+    assert len(formula) > 3000
+    payload = workbook_with({NOTES: f"""
+<worksheet xmlns="{SHEET_NS}"><sheetData><row r="1">
+<c r="A1" t="str"><f>{formula}</f><v>Saved result</v></c>
+</row></sheetData></worksheet>
+""".encode()})
+    result = make_workbook(payload)
+    sheet = load_workbook(BytesIO(result.data))["Source Evidence"]
+    rows = [row for row in sheet.iter_rows() if row[0].value == "Notes" and row[2].value == "A1"]
+    assert len(rows) >= 2
+    assert "".join(row[4].value for row in rows) == formula
+    assert [row[8].value for row in rows] == [f"{index}/{len(rows)}" for index in range(1, len(rows) + 1)]
+    assert all(row[1].value == "Notes" for row in rows)
+    width = int(sheet.column_dimensions["E"].width) - 2
+    for row in rows:
+        assert sheet.row_dimensions[row[4].row].height >= ((len(row[4].value) + width - 1) // width) * 15
+
+
+@pytest.mark.parametrize("formula", ["'[1]Remote'!A1", "XFE1", "A1048577"])
+def test_unsupported_conditional_formatting_is_rejected_with_sheet_evidence(workbook_with, formula):
+    source = f"""
+<worksheet xmlns="{SHEET_NS}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+<conditionalFormatting sqref="A1"><cfRule type="cellIs" operator="greaterThan" priority="1">
+<formula>{formula}</formula></cfRule></conditionalFormatting></worksheet>"""
+    with pytest.raises(WorkbookProblem) as failure:
+        make_workbook(workbook_with({NOTES: source.encode()}))
+    assert failure.value.code == "unsupported_source_feature"
+    assert failure.value.sheet == "Notes"
+    assert failure.value.feature == "conditional formatting formula with unsupported dependencies"

@@ -11,7 +11,9 @@ from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 from fastapi import HTTPException
 from lxml import etree as xml
 
-from app.extraction_reader import Budget, shared_strings, sheet_comments, style_formats, worksheet_cells
+from app.extraction_reader import (
+    Budget, coordinate_parts, formula_cache_status, shared_strings, sheet_comments, style_formats, worksheet_cells,
+)
 from app.reconciliation_evidence import additive_references, markup_recipe, quantity_rate_recipe
 from app.workbook_upload import (
     DOCUMENT_RELATIONSHIP_NAMESPACES, MAX_EXPANDED_BYTES, PACKAGE_RELATIONSHIPS, internal_target, validate_workbook,
@@ -37,10 +39,16 @@ WORKBOOK_ELEMENTS = {
 SHEET_ELEMENTS = {
     "sheetPr", "dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData", "sheetProtection", "autoFilter",
     "sortState", "mergeCells", "phoneticPr", "printOptions", "pageMargins", "pageSetup", "headerFooter",
-    "rowBreaks", "colBreaks", "ignoredErrors", "legacyDrawing", "hyperlinks",
+    "rowBreaks", "colBreaks", "ignoredErrors", "legacyDrawing", "hyperlinks", "conditionalFormatting",
 }
 NAME_UNSAFE = re.compile(r"[\[\]:*?/\\\x00-\x1f]")
-STYLE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
+CF_RULES = {"cellIs", "expression", "colorScale", "dataBar", "iconSet", "top10", "uniqueValues", "duplicateValues", "aboveAverage"}
+CF_ELEMENTS = {"cfRule", "formula", "colorScale", "dataBar", "iconSet", "cfvo", "color"}
+CF_REF = r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}"
+CF_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:E[+-]?[0-9]+)?"
+CF_OPERAND = rf'(?:{CF_REF}(?::{CF_REF})?|{CF_NUMBER}|TRUE|FALSE|"(?:[^"]|"")*")'
+CF_RANGE = re.compile(rf"({CF_REF})(?::({CF_REF}))?", re.I)
+LOCAL_CF_FORMULA = re.compile(rf"({CF_OPERAND})(?:\s*(?:<>|>=|<=|>|<|=)\s*({CF_OPERAND}))?", re.I)
 
 
 class WorkbookProblem(Exception):
@@ -107,6 +115,25 @@ def formula_dependencies(sheet: str, text: str) -> set[str] | None:
     if refs := quantity_rate_recipe(text, sheet):
         return {ref.cell for ref in refs}
     return None
+
+
+def local_conditional_formula(sheet: str, expression: str) -> bool:
+    if comparison := LOCAL_CF_FORMULA.fullmatch(expression):
+        refs = []
+        for operand in comparison.groups():
+            if operand is not None and (cell_range := CF_RANGE.fullmatch(operand)):
+                refs.extend(cell for cell in cell_range.groups() if cell is not None)
+    else:
+        parsed_refs = formula_dependencies(sheet, expression)
+        if parsed_refs is None:
+            return False
+        refs = parsed_refs
+    try:
+        for ref in refs:
+            coordinate_parts(ref.upper().replace("$", ""))
+    except BadZipFile:
+        return False
+    return True
 
 
 def active_formulas(sheet: str, cells: dict[str, dict]) -> set[str]:
@@ -253,6 +280,29 @@ class SourcePackage:
         if properties is not None:
             properties.set("updateLinks", "never")
 
+    @staticmethod
+    def _check_conditional_formatting(root, sheet):
+        for formatting in root.findall(S + "conditionalFormatting"):
+            for node in formatting.iterdescendants():
+                if not isinstance(node.tag, str):
+                    continue
+                kind = xml.QName(node).localname
+                if node.tag != S + kind or kind not in CF_ELEMENTS:
+                    raise unsupported(sheet, f"conditional formatting element {kind}")
+                if kind == "cfRule" and node.get("type") not in CF_RULES:
+                    raise unsupported(sheet, f"conditional formatting rule {node.get('type')}")
+                if kind == "formula":
+                    expression = (node.text or "").strip().removeprefix("=").strip()
+                    if not local_conditional_formula(sheet, expression):
+                        raise unsupported(sheet, "conditional formatting formula with unsupported dependencies")
+                if kind == "cfvo":
+                    value_type = node.get("type")
+                    value = node.get("val")
+                    if value_type not in {"min", "max", "num", "percent", "percentile"} or (
+                        value is not None and not re.fullmatch(CF_NUMBER, value, re.I)
+                    ):
+                        raise unsupported(sheet, "conditional formatting threshold with unsupported dependencies")
+
     def _copy_sheets(self, sheets, reserved):
         if self.entries is None or len(self.entries) != len(sheets):
             raise WorkbookProblem("source_evidence_mismatch", "Source worksheet inventory differs from extraction.")
@@ -269,6 +319,7 @@ class SourcePackage:
             entry.set("name", output_name)
             root = self.read_xml(part)
             self._check_elements(root, SHEET_ELEMENTS, name)
+            self._check_conditional_formatting(root, name)
             for view in root.findall(f"{S}sheetViews/{S}sheetView"):
                 view.attrib.pop("tabSelected", None)
             self._copy_worksheet_resources(root, part, name)
@@ -321,13 +372,15 @@ class SourcePackage:
             if formula is None:
                 continue
             anchor = formula.get("anchor")
+            # Older extraction records still retain the raw blank-string result.
+            formula["cache_status"] = formula_cache_status(cell["cell_type"], cell["raw_value"])
             self.formulas.append((
                 source["name"], output_name, ref, anchor or "", formula["text"] or anchors.get(anchor) or "",
                 cell["raw_value"] or "", formula["cache_status"], "Active internal formula" if ref in safe else "Source snapshot",
             ))
             if ref not in safe:
                 cell["formula"] = None
-                if cell["cell_type"] == "str" and cell["raw_value"] not in {None, ""}:
+                if cell["cell_type"] == "str" and cell["raw_value"] is not None:
                     cell["cell_type"] = "inlineStr"
                     cell["raw_value"] = None
                 elif cell["raw_value"] == "":

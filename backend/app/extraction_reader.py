@@ -156,6 +156,11 @@ def coordinate_name(row: int, column: int) -> str:
     return f"{letters}{row}"
 
 
+def formula_cache_status(kind: str, value: str | None) -> str:
+    # A present empty string result is distinct from a missing result.
+    return "saved_unverified" if value is not None and (value != "" or kind == "str") else "missing"
+
+
 def cell_evidence(element, ns, coordinate, column, strings, formats) -> dict:
     style_ids, format_codes = formats
     kind = element.get("t", "n")
@@ -186,7 +191,7 @@ def cell_evidence(element, ns, coordinate, column, strings, formats) -> dict:
         "formula": {
             "text": formula.text,
             "attributes": dict(formula.attrib),
-            "cache_status": "saved_unverified" if value not in (None, "") else "missing",
+            "cache_status": formula_cache_status(kind, value),
         } if formula is not None else None,
     }
 
@@ -258,7 +263,7 @@ def mark_array_results(rows: list[dict], arrays: list[ArrayRange]) -> None:
                 "type": "array",
                 "range": array.reference,
                 "anchor": array.anchor,
-                "cache_status": "saved_unverified" if cell["raw_value"] not in (None, "") else "missing",
+                "cache_status": formula_cache_status(cell["cell_type"], cell["raw_value"]),
             }
 
 

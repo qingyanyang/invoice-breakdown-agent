@@ -392,11 +392,23 @@ under `outputs/`.
 
 The task owner can retry generation for the same revision, source checksum,
 allocation ID, generator version and template version. Identical requests
-converge on one artifact. A changed input creates a new version and claims a
-unique storage key. Publication rechecks the authorized inputs under the
-task lock after generation. It verifies the stored bytes before recording
-the artifact. Failed writes expose no download, and cleanup checks the
-database for references before deleting an attempted object.
+converge on one available artifact. Reuse verifies the stored size and
+checksum. A changed input, missing object, or corrupted object creates a
+new version with a unique storage key and preserves earlier manifests.
+Publication rechecks the authorized inputs under the task lock and verifies
+the stored bytes before recording the artifact. Failed writes expose no
+download.
+
+If the logs report an output object or local staging file pending cleanup,
+run the cleanup command from the backend with that exact storage key.
+
+```bash
+python -m app.source_cleanup 'outputs/<task-id>/<artifact-id>.xlsx'
+```
+
+The command uses the output backend and checks every workbook manifest
+for a reference while holding the task lock. It also accepts logged local
+`.staging` keys.
 
 The generator follows `SKILL.md` §§4, 7, 9 and 10. The summary uses the
 allocation's displayed area and trade amounts, with Excel formulas for
@@ -412,12 +424,15 @@ layout, merged ranges and supported cell annotations. Source Evidence maps
 original names and coordinates to the copied tabs. A limited set of
 same-sheet additive and markup formulas remains active only when every
 dependency survives. Other source formulas, links and defined names are
-recorded as text. Available source caches remain unverified and missing
-values stay blank. The output contains no live external relationships.
+recorded as text. Long evidence continues on numbered rows that repeat its
+source reference. A saved empty string remains distinct from a missing
+cache. Available source caches remain unverified. The output contains no
+live external relationships.
 
-Transitional XLSX worksheet parts with the supported layout features can
-be copied. Charts, pivot tables, drawings other than legacy notes, and
-unsupported worksheet extensions block generation when encountered. The
+Transitional XLSX worksheets support local conditional formatting with
+supported rules and operands. Charts, pivot tables, drawings other than
+legacy notes, rules with unsupported dependencies, and unsupported
+worksheet extensions block generation when encountered. The
 API identifies the sheet and feature. The workbook is marked
 `generated_awaiting_qa`. Recalculation, visual certification and final
 customer delivery authorization belong to Issue #11.
