@@ -5,6 +5,7 @@ import re
 import struct
 import subprocess
 from dataclasses import dataclass
+from time import monotonic
 from uuid import uuid4
 
 from app.workbook_source import MAX_OUTPUT_BYTES
@@ -28,14 +29,23 @@ class QAEngine:
     runtime: str
     image: str | None
 
-    def run(self, operation: str, data: bytes) -> EngineResult:
+    def run(self, operation: str, data: bytes, *, deadline: float | None = None) -> EngineResult:
         if not self.image or not IMAGE_NAME.fullmatch(self.image):
             raise EngineUnavailable("A local isolated workbook QA image is not configured.")
         name = f"invoice-qa-{uuid4().hex}"
+
+        def available(cap):
+            if deadline is None:
+                return cap
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise EngineUnavailable("Workbook QA exceeded its execution budget.")
+            return min(cap, remaining)
+
         try:
             image_id = subprocess.run(
                 [self.runtime, "image", "inspect", "--format", "{{.Id}}", self.image],
-                capture_output=True, text=True, timeout=5, check=True,
+                capture_output=True, text=True, timeout=available(5), check=True,
             ).stdout.strip()
             if not IMAGE_ID.fullmatch(image_id):
                 raise EngineUnavailable("The isolated workbook QA image has no recognized immutable identity.")
@@ -45,7 +55,7 @@ class QAEngine:
                 "--cpus=1", "--pids-limit=96", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                 "--user=65534:65534", "--env=HOME=/tmp", "--env=TMPDIR=/tmp", "--log-driver=none",
                 "--name", name, "-i", image_id, operation,
-            ], input=data, capture_output=True, timeout=48, check=True)
+            ], input=data, capture_output=True, timeout=available(48), check=True)
         except (OSError, subprocess.SubprocessError):
             raise EngineUnavailable("The isolated workbook QA worker failed or exceeded its limit.") from None
         finally:

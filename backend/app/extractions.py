@@ -1,24 +1,26 @@
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 from uuid import UUID
 
-from anyio import BrokenWorkerProcess, fail_after, to_process, to_thread
+from anyio import BrokenWorkerProcess, fail_after, to_process
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from app.config import settings
+from app.execution import acquire, claim, executing, fence, settle
 from app.extraction_reader import EXTRACTOR_VERSION, ExtractionProblem, extract_workbook
 from app.extraction_tables import source_extractions
 from app.operators import Operator
-from app.source_storage import SourceIntegrityError, SourceStorage, StorageError, read_verified_source
+from app.source_storage import SourceIntegrityError, SourceStorage, StorageError
 from app.tasks import database_for, lock_current_revision, owned_revision, transaction
+from app.worker_io import SourceReadWorker
 from app.workflows import RevisionRequest, workflow_record
 
 router = APIRouter(prefix="/tasks/{task_id}/extraction", tags=["extraction"])
 EXTRACTION_TIMEOUT_SECONDS = 20
+TRANSIENT_EXTRACTION_ERRORS = {"deadline_exceeded", "source_unavailable", "worker_unavailable"}
 FAILURE_HTTP_STATUS = {
     "invalid_workbook": 422,
     "deadline_exceeded": 504,
@@ -26,34 +28,6 @@ FAILURE_HTTP_STATUS = {
     "source_unavailable": 503,
     "worker_unavailable": 503,
 }
-
-
-class SourceReadWorker:
-    def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extraction-source")
-        self.slot = asyncio.Semaphore(1)
-
-    async def read(self, storage: SourceStorage, key: str, size: int, checksum: str) -> bytes:
-        await self.slot.acquire()
-        try:
-            job = asyncio.get_running_loop().run_in_executor(
-                self.executor, read_verified_source, storage, key, size, checksum,
-            )
-        except BaseException:
-            self.slot.release()
-            raise
-
-        def finished(future):
-            self.slot.release()
-            if not future.cancelled():
-                future.exception()
-
-        job.add_done_callback(finished)
-        # The request may time out, but the slot follows the underlying read.
-        return await asyncio.shield(job)
-
-    async def close(self) -> None:
-        await to_thread.run_sync(self.executor.shutdown)
 
 
 class ExtractionDetails(BaseModel):
@@ -140,37 +114,57 @@ async def run_extraction(
     task_id: UUID, payload: RevisionRequest, request: Request, operator: Operator,
 ) -> ExtractionDetails:
     engine = database_for(request)
-    async with transaction(engine) as connection:
-        original = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
-        await require_extraction_ready(connection, original)
-        existing = await extraction_record(connection, original)
-        if existing is not None and existing.status == "extracted":
-            return existing
 
-    try:
-        result = await extract_source(
-            request.app.state.source_storage, original,
-            request.app.state.extraction_limiter, request.app.state.extraction_source_reader,
-        )
-    except ExtractionProblem as error:
-        fields = {"status": "failed", "result": None, "error_code": error.code, "error_detail": error.detail}
-    else:
-        fields = {"status": "extracted", "result": result, "error_code": None, "error_detail": None}
-
-    # Extraction runs outside the task lock. Publish only against the still-current source.
-    async with transaction(engine) as connection:
-        current = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
-        if (
-            current["source_sha256"] != original["source_sha256"]
-            or current["source_key"] != original["source_key"]
+    async def prepare(connection):
+        revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
+        await require_extraction_ready(connection, revision)
+        existing = await extraction_record(connection, revision)
+        if existing is not None and (
+            existing.status == "extracted" or existing.error_code not in TRANSIENT_EXTRACTION_ERRORS
         ):
-            raise HTTPException(409, "Source checksum has changed")
-        await require_extraction_ready(connection, current)
-        record = await publish_outcome(connection, current, fields)
-    if record.status == "failed":
-        raise HTTPException(
-            FAILURE_HTTP_STATUS.get(record.error_code, 413), record.error_detail,
+            return existing, None
+        attempt = await claim(
+            connection, revision, operator, "extraction",
+            [revision["source_key"], revision["source_sha256"], EXTRACTOR_VERSION], settings.execution_extraction_seconds,
         )
+        return revision, attempt
+
+    original, attempt = await acquire(engine, prepare)
+    if attempt is None:
+        return extraction_response(original)
+
+    async with executing(engine, attempt):
+        try:
+            result = await extract_source(
+                request.app.state.source_storage, original,
+                request.app.state.extraction_limiter, request.app.state.extraction_source_reader,
+            )
+        except ExtractionProblem as error:
+            fields = {"status": "failed", "result": None, "error_code": error.code, "error_detail": error.detail}
+            status = "retryable" if error.code in TRANSIENT_EXTRACTION_ERRORS else "failed"
+        else:
+            fields = {"status": "extracted", "result": result, "error_code": None, "error_detail": None}
+            status = "succeeded"
+
+        async with transaction(engine) as connection:
+            current = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
+            if (
+                current["source_sha256"] != original["source_sha256"]
+                or current["source_key"] != original["source_key"]
+            ):
+                raise HTTPException(409, "Source checksum has changed")
+            await require_extraction_ready(connection, current)
+            await fence(connection, attempt)
+            record = await publish_outcome(connection, current, fields)
+            await settle(connection, attempt, status, fields["error_code"], result={
+                "status": record.status, "extractor_version": record.extractor_version, "source_sha256": record.source_sha256,
+            })
+    return extraction_response(record, attempt.headers)
+
+
+def extraction_response(record, headers=None):
+    if record.status == "failed":
+        raise HTTPException(FAILURE_HTTP_STATUS.get(record.error_code, 413), record.error_detail, headers=headers)
     return record
 
 

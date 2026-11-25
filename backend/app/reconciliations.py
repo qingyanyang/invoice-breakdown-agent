@@ -2,18 +2,21 @@ import json
 from typing import Annotated, Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from anyio import to_thread
+from anyio import BrokenWorkerProcess, to_process
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from app.config import settings
+from app.execution import ExecutionFailure, acquire, claim, executing, fence, settle
 from app.extractions import ExtractionDetails, extraction_record
 from app.operators import Operator
 from app.reconcile import reconcile
 from app.reconciliation_tables import source_reconciliations
-from app.tasks import database_for, lock_current_revision, owned_revision, transaction
+from app.request_receipts import ReceiptKey, RequestKey, bind_receipt_context, fingerprint, save_receipt
+from app.tasks import database_for, lock_current_revision, owned_revision, reserve_owned_receipt, transaction
 from app.workflows import RevisionRequest
 
 router = APIRouter(prefix="/tasks/{task_id}/reconciliation", tags=["reconciliation"])
@@ -93,12 +96,8 @@ def identified_questions(extraction: ExtractionDetails, scope: ScopePolicy, repo
 
 
 async def record_outcome(
-    connection: AsyncConnection, extraction: ExtractionDetails, scope: ScopePolicy, decisions: dict,
+    connection: AsyncConnection, extraction: ExtractionDetails, scope: ScopePolicy, decisions: dict, report: dict,
 ) -> ReconciliationDetails:
-    report = await to_thread.run_sync(
-        reconcile, extraction.result, scope.model_dump(),
-        {key: decision["answer"] for key, decision in decisions.items()},
-    )
     identified_questions(extraction, scope, report)
     fields = {
         "status": report["status"], "scope": scope.model_dump(),
@@ -122,18 +121,91 @@ async def record_outcome(
     return result
 
 
-@router.post("")
-async def run_reconciliation(
-    task_id: UUID, payload: ReconcileRequest, request: Request, operator: Operator,
-) -> ReconciliationDetails:
-    async with transaction(database_for(request)) as connection:
+def reconciliation_change(payload, current, operator):
+    if isinstance(payload, ReconcileRequest):
+        scope = payload.scope or (current.scope if current else ScopePolicy())
+        return scope, current.decisions if current else {}
+
+    question = next(
+        (item for item in current.report["questions"] if item["id"] == str(payload.question_id)),
+        None,
+    ) if current else None
+    if question is None:
+        raise HTTPException(409, "Question is no longer pending on this revision")
+    if question.get("response_type") == "source_correction":
+        raise HTTPException(422, "Upload corrected source evidence on a new revision")
+    if payload.answer not in question["options"]:
+        raise HTTPException(422, "Select one of the offered reconciliation answers")
+    return current.scope, {
+        **current.decisions,
+        question["key"]: {
+            "id": question["id"], "kind": question["kind"], "answer": payload.answer,
+            "evidence": question["evidence"], "operator": operator,
+        },
+    }
+
+
+async def apply_reconciliation(task_id, payload, request, operator, idempotency_key):
+    engine = database_for(request)
+    operation = "reconciliation_answer" if isinstance(payload, ReconciliationAnswer) else "reconciliation"
+    key = ReceiptKey.from_request(operator, operation, idempotency_key, [task_id, payload])
+    original_context = None
+
+    async def snapshot(connection):
         revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
         extraction = await require_extraction(connection, revision)
-        current = await reconciliation_record(connection, extraction)
-        scope = payload.scope or (current.scope if current else ScopePolicy())
-        if current and current.scope == scope:
-            return current
-        return await record_outcome(connection, extraction, scope, current.decisions if current else {})
+        return revision, extraction, await reconciliation_record(connection, extraction)
+
+    async def prepare(connection):
+        nonlocal original_context
+        if (receipt := await reserve_owned_receipt(connection, task_id, key)) is not None:
+            return ReconciliationDetails.model_validate(receipt), None
+        revision, extraction, current = await snapshot(connection)
+        source = [extraction.source_sha256, extraction.extractor_version, current.generation if current else None]
+        context = fingerprint(source)
+        if original_context is not None and context != original_context:
+            raise HTTPException(409, "Reconciliation inputs have changed")
+        original_context = context
+        await bind_receipt_context(connection, key, context)
+        scope, decisions = reconciliation_change(payload, current, operator)
+        if current and current.scope == scope and current.decisions == decisions:
+            return await save_receipt(connection, key, current), None
+        material = [*source, scope, decisions]
+        attempt = await claim(connection, revision, operator, operation, material, settings.execution_rules_seconds)
+        return (extraction, current, scope, decisions), attempt
+
+    inputs, attempt = await acquire(engine, prepare)
+    if attempt is None:
+        return inputs
+    extraction, previous, scope, decisions = inputs
+    async with executing(engine, attempt):
+        try:
+            report = await to_process.run_sync(
+                reconcile, extraction.result, scope.model_dump(),
+                {name: decision["answer"] for name, decision in decisions.items()}, cancellable=True,
+            )
+        except BrokenWorkerProcess:
+            raise ExecutionFailure(503, "Reconciliation unavailable", "reconciliation_worker_unavailable", retryable=True) from None
+        async with transaction(engine) as connection:
+            await reserve_owned_receipt(connection, task_id, key)
+            _, current_extraction, current = await snapshot(connection)
+            if current_extraction != extraction or current != previous:
+                raise HTTPException(409, "Reconciliation inputs have changed")
+            await fence(connection, attempt)
+            result = await record_outcome(connection, extraction, scope, decisions, report)
+            await save_receipt(connection, key, result)
+            await settle(
+                connection, attempt, "blocked" if result.status == "blocked" else "succeeded",
+                result={"status": result.status, "generation": result.generation},
+            )
+            return result
+
+
+@router.post("")
+async def run_reconciliation(
+    task_id: UUID, payload: ReconcileRequest, request: Request, operator: Operator, idempotency_key: RequestKey = None,
+) -> ReconciliationDetails:
+    return await apply_reconciliation(task_id, payload, request, operator, idempotency_key)
 
 
 @router.get("")
@@ -149,25 +221,6 @@ async def get_reconciliation(task_id: UUID, request: Request, operator: Operator
 
 @router.post("/answers")
 async def answer_reconciliation(
-    task_id: UUID, payload: ReconciliationAnswer, request: Request, operator: Operator,
+    task_id: UUID, payload: ReconciliationAnswer, request: Request, operator: Operator, idempotency_key: RequestKey = None,
 ) -> ReconciliationDetails:
-    async with transaction(database_for(request)) as connection:
-        revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
-        extraction = await require_extraction(connection, revision)
-        current = await reconciliation_record(connection, extraction)
-        question = next(
-            (item for item in current.report["questions"] if item["id"] == str(payload.question_id)),
-            None,
-        ) if current else None
-        if question is None:
-            raise HTTPException(409, "Question is no longer pending on this revision")
-        if question.get("response_type") == "source_correction":
-            raise HTTPException(422, "Upload corrected source evidence on a new revision")
-        if payload.answer not in question["options"]:
-            raise HTTPException(422, "Select one of the offered reconciliation answers")
-        decisions = dict(current.decisions)
-        decisions[question["key"]] = {
-            "id": question["id"], "kind": question["kind"], "answer": payload.answer,
-            "evidence": question["evidence"], "operator": operator,
-        }
-        return await record_outcome(connection, extraction, current.scope, decisions)
+    return await apply_reconciliation(task_id, payload, request, operator, idempotency_key)

@@ -213,6 +213,8 @@ async def test_timed_out_storage_read_keeps_its_worker_slot(task_runtime, workbo
 
     monkeypatch.setattr(LocalSourceStorage, "read", blocked_read)
     monkeypatch.setattr(extractions, "EXTRACTION_TIMEOUT_SECONDS", 0.15)
+    monkeypatch.setattr(settings, "execution_max_attempts", 5)
+    monkeypatch.setattr(settings, "execution_retry_base_seconds", 0.01)
     async with running_service() as client:
         try:
             task_id = await create_ready_task(client, workbook_with({}))

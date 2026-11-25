@@ -17,13 +17,14 @@ from app.database import (
     repository_heads,
 )
 from app.delivery import router as delivery_router
-from app.extractions import SourceReadWorker
+from app.execution_api import router as execution_router
 from app.extractions import router as extraction_router
 from app.operators import operator_credentials
 from app.qa_engine import QAEngine
 from app.reconciliations import router as reconciliation_router
 from app.source_storage import create_output_storage, create_source_storage
 from app.tasks import router as task_router
+from app.worker_io import BlockingWorker, SourceReadWorker
 from app.workbooks import router as workbook_router
 from app.workflows import router as workflow_router
 
@@ -41,6 +42,10 @@ async def lifespan(app: FastAPI):
     app.state.database_engine = engine
     app.state.extraction_limiter = CapacityLimiter(1)
     app.state.extraction_source_reader = SourceReadWorker()
+    app.state.storage_worker = BlockingWorker("workbook-storage", capacity=2)
+    app.state.upload_validator = BlockingWorker("workbook-validation")
+    app.state.qa_worker = BlockingWorker("workbook-qa")
+    app.state.classification_limiter = CapacityLimiter(1)
     app.state.source_storage = None
     app.state.output_storage = None
     app.state.workbook_limiter = CapacityLimiter(1)
@@ -63,6 +68,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await app.state.extraction_source_reader.close()
+        await app.state.storage_worker.close()
+        await app.state.upload_validator.close()
+        await app.state.qa_worker.close()
         if app.state.source_storage is not None:
             app.state.source_storage.close()
         if app.state.output_storage is not None:
@@ -77,6 +85,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(task_router)
+app.include_router(execution_router)
 app.include_router(workflow_router)
 app.include_router(extraction_router)
 app.include_router(reconciliation_router)

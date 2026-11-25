@@ -18,6 +18,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.allocations import AllocationInputs, allocation_record, current_inputs
+from app.config import settings
+from app.execution import (
+    ExecutionFailure, acquire, claim, executing, fence, object_may_be_discarded, register_object, settle,
+    write_registered_object,
+)
 from app.operators import Operator
 from app.source_storage import (
     SourceAlreadyExists, SourceIntegrityError, StorageError, StorageNotFound, read_verified_source,
@@ -103,14 +108,15 @@ def output_storage(request: Request):
     return storage
 
 
-async def workbook_is_reusable(storage, record) -> bool:
+async def workbook_is_reusable(worker, storage, record) -> bool:
     if record is None:
         return False
     try:
-        await to_thread.run_sync(read_verified_source, storage, record["storage_key"], record["size"], record["sha256"])
+        with fail_after(settings.execution_workbook_seconds):
+            await worker.run(read_verified_source, storage, record["storage_key"], record["size"], record["sha256"])
     except (StorageNotFound, SourceIntegrityError):
         return False
-    except StorageError:
+    except (StorageError, TimeoutError):
         raise HTTPException(503, "Workbook storage unavailable") from None
     return True
 
@@ -131,80 +137,129 @@ async def discard_unreferenced_workbook(engine, storage, task_id: UUID, key: str
         existing = await connection.scalar(
             select(workbook_artifacts.c.artifact_id).where(workbook_artifacts.c.storage_key == key)
         )
-        if existing is not None:
+        if existing is not None or not await object_may_be_discarded(connection, key):
             return False
-        await to_thread.run_sync(storage.delete, key)
-        return True
+    await to_thread.run_sync(storage.delete, key)
+    return True
 
 
 @router.post("")
 async def create_workbook(task_id: UUID, payload: WorkbookRequest, request: Request, operator: Operator) -> WorkbookDetails:
     engine = database_for(request)
-    async with transaction(engine) as connection:
+    worker = request.app.state.storage_worker
+
+    async def snapshot(connection):
         revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
-        original = await workbook_inputs(connection, revision, payload.expected_allocation_id)
-        storage = output_storage(request)
-        existing = await find_workbook(connection, original)
-        if await workbook_is_reusable(storage, existing):
-            return WorkbookDetails.model_validate(existing)
+        return await workbook_inputs(connection, revision, payload.expected_allocation_id)
 
-    try:
-        with fail_after(GENERATION_TIMEOUT):
-            async with request.app.state.workbook_limiter:
-                data = await request.app.state.extraction_source_reader.read(
-                    storage_for(request), revision["source_key"], revision["source_size"], revision["source_sha256"],
-                )
-                generated = await to_process.run_sync(
-                    generate_workbook, data, original.extraction, original.reconciliation, original.allocation,
-                    cancellable=True,
-                )
-    except WorkbookProblem as error:
-        raise HTTPException(422, error.report()) from None
-    except TimeoutError:
-        raise HTTPException(503, "Workbook generation exceeded its time limit") from None
-    except SourceIntegrityError:
-        raise HTTPException(503, "Source integrity check failed") from None
-    except (StorageError, BrokenWorkerProcess):
-        raise HTTPException(503, "Workbook generation unavailable") from None
-
-    artifact_id = uuid4()
-    key = f"outputs/{task_id}/{artifact_id}.xlsx"
-    checksum = sha256(generated.data).hexdigest()
-    size = len(generated.data)
-    attempted = False
-    try:
+    for _ in range(3):
         async with transaction(engine) as connection:
-            revision = await lock_current_revision(connection, task_id, operator, payload.expected_revision)
-            current = await workbook_inputs(connection, revision, payload.expected_allocation_id)
+            original = await snapshot(connection)
+            existing = await find_workbook(connection, original)
+
+        storage = output_storage(request)
+        if await workbook_is_reusable(worker, storage, existing):
+            async with transaction(engine) as connection:
+                current = await snapshot(connection)
+                latest = await find_workbook(connection, current)
+                if current.identity == original.identity and latest is not None and latest["artifact_id"] == existing["artifact_id"]:
+                    return WorkbookDetails.model_validate(latest)
+            continue
+
+        prior_id = existing["artifact_id"] if existing is not None else None
+
+        async def prepare(connection):
+            current = await snapshot(connection)
             if current.identity != original.identity:
                 raise HTTPException(409, "Workbook generation inputs have changed")
-            existing = await find_workbook(connection, current)
-            if await workbook_is_reusable(storage, existing):
-                return WorkbookDetails.model_validate(existing)
-            latest_version = await connection.scalar(
-                select(func.max(workbook_artifacts.c.version)).where(workbook_artifacts.c.task_id == task_id)
+            latest = await find_workbook(connection, current)
+            if (latest["artifact_id"] if latest is not None else None) != prior_id:
+                return None, None
+            attempt = await claim(
+                connection, current.revision, operator, "workbook",
+                [current.identity, prior_id], settings.execution_workbook_seconds,
             )
-            version = (latest_version or 0) + 1
+            return None, attempt
+
+        _, attempt = await acquire(engine, prepare)
+        if attempt is not None:
+            break
+    else:
+        raise HTTPException(409, "The review workbook changed while checking storage")
+
+    revision = original.revision
+    artifact_id = uuid4()
+    key = f"outputs/{task_id}/{artifact_id}.xlsx"
+    attempted = False
+    try:
+        async with executing(engine, attempt):
+            try:
+                with fail_after(GENERATION_TIMEOUT):
+                    async with request.app.state.workbook_limiter:
+                        data = await request.app.state.extraction_source_reader.read(
+                            storage_for(request), revision["source_key"], revision["source_size"], revision["source_sha256"],
+                        )
+                        generated = await to_process.run_sync(
+                            generate_workbook, data, original.extraction, original.reconciliation, original.allocation,
+                            cancellable=True,
+                        )
+            except WorkbookProblem as error:
+                raise ExecutionFailure(422, error.report(), error.code) from None
+            except TimeoutError:
+                raise ExecutionFailure(503, "Workbook generation exceeded its time limit", "generation_timeout", retryable=True) from None
+            except SourceIntegrityError:
+                raise ExecutionFailure(503, "Source integrity check failed", "source_integrity") from None
+            except (StorageError, BrokenWorkerProcess):
+                raise ExecutionFailure(503, "Workbook generation unavailable", "generation_unavailable", retryable=True) from None
+
+            async with transaction(engine) as connection:
+                current = await snapshot(connection)
+                if current.identity != original.identity:
+                    raise HTTPException(409, "Workbook generation inputs have changed")
+                await fence(connection, attempt)
+
+            checksum, size = sha256(generated.data).hexdigest(), len(generated.data)
+            await register_object(engine, attempt, key)
             attempted = True
-            await to_thread.run_sync(storage.put, key, generated.data)
-            await to_thread.run_sync(read_verified_source, storage, key, size, checksum)
-            result = await connection.execute(insert(workbook_artifacts).values(
-                **current.identity, artifact_id=artifact_id, version=version, storage_key=key, size=size, sha256=checksum,
-                filename=filename_for(generated.project_name, revision["source_filename"], revision["revision"], version),
-                report={**generated.report, "original_source_integrity": "sha256_matched_before_generation"},
-            ).returning(workbook_artifacts))
-            return WorkbookDetails.model_validate(result.mappings().one())
-    except SourceAlreadyExists:
-        raise HTTPException(409, "Workbook storage key already exists; retry generation") from None
-    except BaseException as error:
-        if attempted:
+            try:
+                await write_registered_object(engine, attempt, worker, storage, key, generated.data)
+                await worker.run(read_verified_source, storage, key, size, checksum)
+            except SourceAlreadyExists:
+                attempted = False
+                raise ExecutionFailure(409, "Workbook storage key already exists; retry generation", "storage_collision", retryable=True) from None
+            except StorageError:
+                raise ExecutionFailure(503, "Workbook storage unavailable", "output_storage_unavailable", retryable=True) from None
+
+            async with transaction(engine) as connection:
+                current = await snapshot(connection)
+                if current.identity != original.identity:
+                    raise HTTPException(409, "Workbook generation inputs have changed")
+                await fence(connection, attempt)
+                latest = await find_workbook(connection, current)
+                if (latest["artifact_id"] if latest is not None else None) != prior_id:
+                    raise HTTPException(409, "The review workbook has changed")
+                latest_version = await connection.scalar(
+                    select(func.max(workbook_artifacts.c.version)).where(workbook_artifacts.c.task_id == task_id)
+                )
+                version = (latest_version or 0) + 1
+                result = await connection.execute(insert(workbook_artifacts).values(
+                    **current.identity, artifact_id=artifact_id, version=version, storage_key=key, size=size, sha256=checksum,
+                    filename=filename_for(generated.project_name, revision["source_filename"], revision["revision"], version),
+                    report={**generated.report, "original_source_integrity": "sha256_matched_before_generation"},
+                ).returning(workbook_artifacts))
+                await settle(connection, attempt, "succeeded", result={
+                    "artifact_id": artifact_id, "version": version, "sha256": checksum,
+                })
+                return WorkbookDetails.model_validate(result.mappings().one())
+    except BaseException:
+        if attempted and key in worker.writes:
+            logger.warning("Workbook cleanup pending for key %s", key)
+        elif attempted:
             try:
                 with CancelScope(shield=True):
                     await discard_unreferenced_workbook(engine, storage, task_id, key)
             except (StorageError, SQLAlchemyError):
                 logger.warning("Workbook cleanup pending for key %s", key)
-        if isinstance(error, StorageError):
-            raise HTTPException(503, "Workbook storage unavailable") from None
         raise
 
 

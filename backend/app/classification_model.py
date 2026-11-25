@@ -136,7 +136,11 @@ async def propose(settings: Settings, specification: PrimarySpecification, input
                     headers={"Authorization": f"Bearer {settings.llm_api_key.get_secret_value()}"},
                 )
                 response.raise_for_status()
-    except (httpx.HTTPError, TimeoutError):
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        code = "model_unavailable" if status in {408, 429} or status >= 500 else "model_request_rejected"
+        raise ClassificationModelError(code) from None
+    except (httpx.RequestError, TimeoutError):
         raise ClassificationModelError("model_unavailable") from None
     try:
         choice = response.json()["choices"][0]
