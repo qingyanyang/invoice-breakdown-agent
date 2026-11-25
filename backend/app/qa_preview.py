@@ -1,6 +1,7 @@
 """Prove that each workbook cell's text is actually painted in its preview region."""
 
 import re
+import os
 import unicodedata
 from collections import defaultdict
 from copy import deepcopy
@@ -207,6 +208,7 @@ class PreviewPaint(PDFTextDevice):
         self.regions.extend(self.cell_refs)
         self.text = defaultdict(list)
         self.painted = False
+        self.probe = []
 
     def paint_path(self, gstate, stroke, fill, evenodd, path):
         if self.marker_colors is None or not fill or gstate.ncs.name != "DeviceRGB":
@@ -232,6 +234,8 @@ class PreviewPaint(PDFTextDevice):
             text = "\ufffd"
         if self.painted and text.strip():
             glyph = LTChar(matrix, font, fontsize, scaling, rise, text, width, font.char_disp(cid), ncs, graphicstate)
+            if os.getenv("TEST_QA_WORKER_IMAGE"):
+                self.probe.append((text, tuple(round(i, 2) for i in glyph.bbox), self.clip))
             if contains(self.clip, glyph.bbox):
                 cells = [cell for cell in self.regions.find(glyph.bbox) if contains(cell.bbox, glyph.bbox)]
                 if len(cells) == 1:
@@ -273,6 +277,18 @@ def verify_preview(book, pdf, measured, colors, witnesses):
                 location(sheet.name, ref) for ref, value in expected.items()
                 if text_key("".join(paint.text.get(ref, ()))) != value
             )
+            if os.getenv("TEST_QA_WORKER_IMAGE"):
+                for ref, value in expected.items():
+                    found = text_key("".join(paint.text.get(ref, ())))
+                    if found == value:
+                        continue
+                    candidates = marker_paint.marker_boxes.get(ref)
+                    print("QA_PROBE", sheet.name, ref, repr(value), repr(found), candidates, flush=True)
+                    if ref in {"A1", "A2", "D3", "D6", "D7"} and candidates:
+                        left, bottom, right, top = next(iter(candidates))
+                        nearby = [(t, box, clip) for t, box, clip in paint.probe
+                                  if left - 9 < box[0] < right + 15 and bottom - 4 < box[1] < top + 4]
+                        print("QA_GLYPHS", sheet.name, ref, nearby[:180], flush=True)
             report.append({
                 "sheet": sheet.name, "visibility": sheet.state, "page": page_no,
                 "range": populated_range(list(expected)), "populated_cells": len(expected),
