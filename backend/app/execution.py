@@ -11,15 +11,15 @@ from time import monotonic
 from uuid import UUID, uuid4
 
 from anyio import CancelScope, fail_after
-from fastapi import HTTPException
-from fastapi.encoders import jsonable_encoder
+from pydantic_core import to_jsonable_python
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.outcomes import FailureKind, UseCaseError
 from app.config import settings
 from app.execution_tables import execution_objects, execution_runs
-from app.request_receipts import fingerprint
+from app.identity import fingerprint
 from app.source_storage import write_with_outcome
 
 logger = logging.getLogger(__name__)
@@ -38,19 +38,19 @@ async def transaction(engine):
                 yield connection
     except (SQLAlchemyError, TimeoutError) as error:
         logger.warning("Task database operation failed: %s", type(error).__name__)
-        raise HTTPException(503, "Task database unavailable") from None
+        raise UseCaseError(FailureKind.UNAVAILABLE, "Task database unavailable") from None
 
 
-class ExecutionFailure(HTTPException):
-    def __init__(self, status: int, detail, code: str, *, retryable: bool = False):
-        super().__init__(status, detail)
+class ExecutionFailure(UseCaseError):
+    def __init__(self, kind: FailureKind, detail, code: str, *, retryable: bool = False):
+        super().__init__(kind, detail)
         self.code = code
         self.retryable = retryable
 
 
-class StaleAttempt(HTTPException):
+class StaleAttempt(UseCaseError):
     def __init__(self, attempt):
-        super().__init__(409, "Execution attempt is no longer current", headers=attempt.headers)
+        super().__init__(FailureKind.CONFLICT, "Execution attempt is no longer current", execution_id=attempt.id)
 
 
 @dataclass(frozen=True)
@@ -83,11 +83,6 @@ class Attempt:
             execution_runs.c.deadline > clock,
         )
 
-    @property
-    def headers(self):
-        return {"X-Execution-Id": str(self.id)}
-
-
 @dataclass(frozen=True)
 class Unavailable:
     id: UUID
@@ -97,17 +92,17 @@ class Unavailable:
     exhaustion_reason: str | None = None
 
     def error(self):
-        headers = {"X-Execution-Id": str(self.id)}
-        status_code = 409
+        kind = FailureKind.CONFLICT
+        retry_after = None
         if self.status in {"running", "retryable"}:
-            status_code = 202
-            headers["Retry-After"] = str(max(1, ceil(self.seconds or 0)))
+            kind = FailureKind.PENDING
+            retry_after = max(1, ceil(self.seconds or 0))
         if self.status == "exhausted":
-            status_code = 503
+            kind = FailureKind.UNAVAILABLE
         detail = {"execution_id": str(self.id), "status": self.status, "failure_code": self.failure_code}
         if self.exhaustion_reason is not None:
             detail["exhaustion_reason"] = self.exhaustion_reason
-        return HTTPException(status_code, detail, headers=headers)
+        return UseCaseError(kind, detail, execution_id=self.id, retry_after=retry_after)
 
 
 @dataclass(frozen=True)
@@ -227,7 +222,7 @@ async def settle(connection, attempt: Attempt, status: str, failure_code: str | 
             status, retry_at = "exhausted", None
     settled = await connection.scalar(update(execution_runs).where(*attempt.live_filters).values(
         status=status, failure_code=failure_code, exhaustion_reason=exhaustion_reason,
-        result=jsonable_encoder(result), retry_at=retry_at, updated_at=now,
+        result=to_jsonable_python(result, by_alias=True), retry_at=retry_at, updated_at=now,
         worker_token=None, lease_expires_at=None,
     ).returning(execution_runs.c.id))
     if settled is None:
@@ -248,7 +243,7 @@ async def heartbeat(engine, attempt):
                 ).returning(execution_runs.c.id))
                 if renewed is None:
                     return
-        except HTTPException:
+        except UseCaseError:
             # An unavailable database cannot extend or transfer an attempt's authority.
             return
 
@@ -258,7 +253,7 @@ async def record_failure(engine, attempt, status, code):
         with CancelScope(shield=True):
             async with transaction(engine) as connection:
                 await settle(connection, attempt, status, code)
-    except HTTPException:
+    except UseCaseError:
         # Expired attempts cannot settle, even when no replacement has claimed the run yet.
         # Claim and history evaluate abandoned leases and elapsed attempt deadlines.
         pass
@@ -272,29 +267,30 @@ async def executing(engine, attempt: Attempt):
             yield
     except TimeoutError:
         await record_failure(engine, attempt, "retryable", "attempt_deadline")
-        raise HTTPException(504, "Execution attempt exceeded its time limit", headers=attempt.headers) from None
+        raise UseCaseError(FailureKind.TIMED_OUT, "Execution attempt exceeded its time limit", execution_id=attempt.id) from None
     except ExecutionFailure as error:
         await record_failure(engine, attempt, "retryable" if error.retryable else "failed", error.code)
-        error.headers = attempt.headers
+        error.execution_id = attempt.id
         raise
     except SQLAlchemyError as error:
         logger.warning("Execution database operation failed: %s", type(error).__name__)
         await record_failure(engine, attempt, "retryable", "database_unavailable")
-        raise HTTPException(503, "Task database unavailable", headers=attempt.headers) from None
+        raise UseCaseError(FailureKind.UNAVAILABLE, "Task database unavailable", execution_id=attempt.id) from None
     except StaleAttempt:
         raise
-    except HTTPException as error:
-        error.headers = {**(error.headers or {}), **attempt.headers}
-        if error.status_code in {409, 503}:
+    except UseCaseError as error:
+        error.execution_id = attempt.id
+        if error.kind in {FailureKind.CONFLICT, FailureKind.UNAVAILABLE}:
+            unavailable = error.kind == FailureKind.UNAVAILABLE
             await record_failure(
-                engine, attempt, "retryable" if error.status_code == 503 else "failed",
-                "database_or_dependency_unavailable" if error.status_code == 503 else "inputs_changed",
+                engine, attempt, "retryable" if unavailable else "failed",
+                "database_or_dependency_unavailable" if unavailable else "inputs_changed",
             )
         raise
     except Exception as error:
         logger.error("Execution failed unexpectedly: %s", type(error).__name__)
         await record_failure(engine, attempt, "failed", "execution_error")
-        raise HTTPException(500, "Execution failed", headers=attempt.headers) from None
+        raise UseCaseError(FailureKind.FAILED, "Execution failed", execution_id=attempt.id) from None
     finally:
         renewal.cancel()
         with suppress(asyncio.CancelledError):

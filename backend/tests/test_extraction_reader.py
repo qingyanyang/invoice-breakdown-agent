@@ -3,7 +3,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from app import extraction_reader as reader
+from app.features.extraction import reader
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "invoice_breakdown"
 SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"

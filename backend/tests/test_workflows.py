@@ -6,18 +6,19 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from fastapi import HTTPException
+from app.outcomes import FailureKind, UseCaseError
 from httpx import ASGITransport, AsyncClient
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import OperationalError
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import main, workflows
+from app import main
+from app.workflows import gst as workflows
 from app.checkpoints import open_checkpointer, setup_checkpoints
 from app.config import settings
 from app.database import ALEMBIC_INI
-from app.invoice_graph import compile_invoice_graph
+from app.workflows.graph import compile_invoice_graph
 
 ALICE = {"Authorization": "Bearer " + "a" * 40}
 BOB = {"Authorization": "Bearer " + "b" * 40}
@@ -183,7 +184,7 @@ async def test_recovery_uses_accepted_answer_after_restart(
         if checkpoint_already_advanced:
             await original(*args)
             raise SQLAlchemyError("simulated transaction interruption after checkpoint")
-        raise HTTPException(503, "simulated interruption before checkpoint")
+        raise UseCaseError(FailureKind.UNAVAILABLE, "simulated interruption before checkpoint")
 
     async with running_service() as client:
         task_id, question = await pause_for_gst(client, workbook_with({}))

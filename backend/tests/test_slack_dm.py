@@ -13,18 +13,22 @@ from pydantic import SecretStr
 from pypdf import PdfWriter
 from sqlalchemy import func, select, update
 
-from app import classification_model, main, workflows
+from app import main
+from app.features.classification import model as classification_model
+from app.workflows import gst as workflows
 from app.checkpoints import setup_checkpoints
 from app.config import settings
 from app.execution import ExecutionFailure
 from app.execution_tables import execution_runs
-from app.slack import routes, store
-from app.slack.core import Core
-from app.slack.protocol import SlackClient, SlackError
-from app.slack.routes import process_one
-from app.slack.service import OUT_OF_SCOPE, preview_sheets
-from app.slack.tables import files, inbox, threads
-from app.task_tables import tasks
+from app.outcomes import FailureKind, Rejection
+from app.workflows.pipeline import InvoiceWorkflow, StageRejected
+from app.channels.slack import worker
+from app.channels.slack import store
+from app.channels.slack.protocol import SlackClient, SlackError
+from app.channels.slack.worker import process_one
+from app.channels.slack.service import OUT_OF_SCOPE, preview_sheets
+from app.channels.slack.tables import files, inbox, threads
+from app.features.tasks.tables import tasks
 from test_allocation_api import fixture_model
 from test_classification_api import configured_skill
 from test_reconciliation import WORKSHEET, source_sheet
@@ -340,23 +344,22 @@ def test_multi_page_visual_control_requires_complete_preview_coverage():
         preview_sheets(coverage, output.getvalue())
 
 
-def intercept_core(monkeypatch, hook, *, observe=None):
-    class InterceptedCore(Core):
-        def __init__(self, app, operator):
-            super().__init__(app, operator)
-            original = self.client.request
+def observe_workflow(monkeypatch, before, *, observe=None):
+    run = InvoiceWorkflow.run
 
-            async def request(method, path, **kwargs):
-                response = await hook(method, path, kwargs)
-                if response is None:
-                    response = await original(method, path, **kwargs)
-                if observe is not None:
-                    observe(method, path, kwargs, response)
-                return response
+    async def observed(self, stage, operation, *inputs, **options):
+        await before(stage, inputs, options)
+        try:
+            result = await run(self, stage, operation, *inputs, **options)
+        except StageRejected as error:
+            if observe is not None:
+                observe(stage, error.rejection)
+            raise
+        if observe is not None:
+            observe(stage, result)
+        return result
 
-            self.client.request = request
-
-    monkeypatch.setattr(routes, "Core", InterceptedCore)
+    monkeypatch.setattr(InvoiceWorkflow, "run", observed)
 
 
 async def make_retries_due(*, file_retry=False):
@@ -446,7 +449,7 @@ async def test_real_core_202_defers_workflow_without_advancing_dependents(
         if not entered.is_set():
             entered.set()
             if pending_status == "retryable":
-                raise ExecutionFailure(503, "Checkpoints temporarily unavailable", "checkpoint_unavailable", retryable=True)
+                raise ExecutionFailure(FailureKind.UNAVAILABLE, "Checkpoints temporarily unavailable", "checkpoint_unavailable", retryable=True)
             await release.wait()
         return await initialize(engine, revision, attempt)
 
@@ -456,36 +459,42 @@ async def test_real_core_202_defers_workflow_without_advancing_dependents(
     contender = None
     workflow_responses = []
     extraction_requests = []
+    http_probes = []
 
-    def observe(method, path, kwargs, response):
-        if method == "POST" and path.endswith("/workflow"):
-            workflow_responses.append((kwargs["headers"]["Idempotency-Key"], response))
-        if method == "POST" and path.endswith("/extraction"):
-            extraction_requests.append(path)
+    def observe(stage, outcome):
+        if stage == "workflow":
+            workflow_responses.append(outcome)
+        if stage == "extraction":
+            extraction_requests.append(outcome)
 
     async with service() as client:
-        async def start_competing_request(method, path, _kwargs):
+        async def start_competing_request(stage, inputs, _options):
             nonlocal contender
-            if method == "POST" and path.endswith("/workflow") and contender is None:
+            if stage == "workflow" and contender is None:
+                path = f"/tasks/{inputs[0]}/workflow"
                 contender = create_task(client.post(path, json={"expected_revision": 2}, headers=ALICE))
                 with fail_after(8):
                     await entered.wait()
                     if pending_status == "retryable":
                         await contender
+                    http_probes.append(await client.post(path, json={"expected_revision": 2}, headers=ALICE))
 
-        intercept_core(monkeypatch, start_competing_request, observe=observe)
+        observe_workflow(monkeypatch, start_competing_request, observe=observe)
         try:
             await post_event(client, event("EvCorePending", file_id="FSOURCE"))
             await drain(fake)
-            (first_key, first), = workflow_responses
+            pending, = workflow_responses
+            first, = http_probes
             assert first.status_code == 202 and first.json()["detail"]["status"] == pending_status
+            assert pending.kind == FailureKind.PENDING and pending.detail == first.json()["detail"]
+            assert 0 <= int(first.headers["Retry-After"]) - pending.retry_after <= 1
             run, = [row for row in await rows(execution_runs) if row["operation"] == "checkpoint_start"]
-            assert str(run["id"]) == first.json()["detail"]["execution_id"]
+            assert run["id"] == pending.execution_id and str(run["id"]) == first.headers["X-Execution-Id"]
             assert run["operation"] == "checkpoint_start" and run["status"] == pending_status
             queued, = await rows(inbox)
             assert queued["state"] == "queued" and queued["error"] == "core_execution_pending"
             assert queued["attempts"] == 0
-            assert (queued["available_at"] - queued["created_at"]).total_seconds() >= int(first.headers["Retry-After"])
+            assert (queued["available_at"] - queued["created_at"]).total_seconds() >= pending.retry_after
             assert fake.messages == [] and fake.staged == {} and extraction_requests == []
             await drain(fake)
             assert len(workflow_responses) == 1 and extraction_requests == []
@@ -505,8 +514,9 @@ async def test_real_core_202_defers_workflow_without_advancing_dependents(
         await make_retries_due()
         await drain(fake)
         assert len(workflow_responses) == 2
-        second_key, second = workflow_responses[1]
-        assert second_key == first_key and success(second)["status"] == "ready_for_extraction"
+        assert workflow_responses[1]["status"] == "ready_for_extraction"
+        recovered, = [row for row in await rows(execution_runs) if row["operation"] == "checkpoint_start"]
+        assert recovered["id"] == run["id"]
         assert len(extraction_requests) == 1
         assert fake.button("Trade Summary!D7")
         done, = await rows(inbox)
@@ -516,17 +526,17 @@ async def test_real_core_202_defers_workflow_without_advancing_dependents(
 
 @pytest.mark.anyio
 async def test_pending_upload_reuses_bound_source_event_and_core_receipt(slack_demo, monkeypatch):
-    monkeypatch.setattr(routes, "MAX_EVENT_ATTEMPTS", 1)
+    monkeypatch.setattr(worker, "MAX_EVENT_ATTEMPTS", 1)
     monkeypatch.setattr(store, "MAX_EVENT_ATTEMPTS", 1)
     upload_keys = []
 
-    async def unavailable(method, path, kwargs):
-        if method == "PUT" and path.endswith("/source"):
-            upload_keys.append(kwargs["headers"]["Idempotency-Key"])
+    async def unavailable(stage, _inputs, options):
+        if stage == "source":
+            upload_keys.append(options["idempotency_key"])
             if len(upload_keys) == 1:
-                return httpx.Response(503, json={"detail": "Temporary source storage problem"})
+                raise StageRejected("source", Rejection(FailureKind.UNAVAILABLE, "Temporary source storage problem"))
 
-    intercept_core(monkeypatch, unavailable)
+    observe_workflow(monkeypatch, unavailable)
     await setup_checkpoints(settings)
     fake = FakeSlack(slack_demo)
     async with service() as client:

@@ -7,10 +7,11 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
-from app import extractions, main
+from app import main
+from app.features.extraction import use_cases as extractions
 from app.checkpoints import setup_checkpoints
 from app.config import settings
-from app.extraction_reader import EXTRACTOR_VERSION
+from app.features.extraction.reader import EXTRACTOR_VERSION
 from app.source_storage import LocalSourceStorage
 
 ALICE = {"Authorization": "Bearer " + "a" * 40}

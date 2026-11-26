@@ -1,42 +1,15 @@
 """Bind normalized mutation requests to durable, owner-scoped receipts."""
 
-import json
 from dataclasses import dataclass
-from decimal import Decimal
 from hashlib import sha256
-from typing import Annotated
-from uuid import UUID
 
-from fastapi import Header, HTTPException
-from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
+from pydantic_core import to_jsonable_python
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 
+from app.outcomes import FailureKind, UseCaseError
+from app.identity import fingerprint
 from app.execution_tables import request_receipts
-
-RequestKey = Annotated[
-    str | None, Header(alias="Idempotency-Key", min_length=1, max_length=128, pattern=r"^[!-~]+$"),
-]
-
-
-def encode_identity(value):
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode="python")
-    if isinstance(value, Decimal):
-        if not value:
-            return "0"
-        fixed = format(value, "f")
-        return fixed.rstrip("0").rstrip(".") if "." in fixed else fixed
-    if isinstance(value, UUID):
-        return str(value)
-    raise TypeError("Unsupported value in request identity")
-
-
-def fingerprint(value) -> str:
-    encoded = json.dumps(value, default=encode_identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return sha256(encoded.encode()).hexdigest()
-
 
 @dataclass(frozen=True)
 class ReceiptKey:
@@ -68,7 +41,7 @@ async def reserve_receipt(connection, key: ReceiptKey | None):
         select(request_receipts).filter_by(**key.identity).with_for_update(),
     )).mappings().one()
     if receipt["payload_sha256"] != key.payload_sha256:
-        raise HTTPException(409, "Idempotency key is already bound to different input")
+        raise UseCaseError(FailureKind.CONFLICT, "Idempotency key is already bound to different input")
     return receipt["response"]
 
 
@@ -84,12 +57,12 @@ async def bind_receipt_context(connection, key: ReceiptKey | None, digest: str):
             update(request_receipts).filter_by(**key.identity).values(context_sha256=digest),
         )
     elif previous != digest:
-        raise HTTPException(409, "Inputs have changed since this request was accepted")
+        raise UseCaseError(FailureKind.CONFLICT, "Inputs have changed since this request was accepted")
 
 
 async def save_receipt(connection, key: ReceiptKey | None, response):
     if key is not None:
         await connection.execute(update(request_receipts).filter_by(**key.identity).values(
-            response=jsonable_encoder(response),
+            response=to_jsonable_python(response, by_alias=True),
         ))
     return response

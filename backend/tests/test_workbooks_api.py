@@ -7,7 +7,9 @@ import pytest
 from openpyxl import load_workbook
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import classification_model, main, source_cleanup, workbooks
+from app import main, source_cleanup
+from app.features.classification import model as classification_model
+from app.features.workbooks import use_cases as workbooks
 from app.checkpoints import setup_checkpoints
 from app.config import settings
 from app.source_storage import StorageError

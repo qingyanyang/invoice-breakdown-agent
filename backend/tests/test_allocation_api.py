@@ -6,7 +6,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from app import classification_model
+from app.features.classification import model as classification_model
 from app.checkpoints import setup_checkpoints
 from app.config import settings
 from test_classification_api import START, configured_skill, model_answer

@@ -41,7 +41,9 @@ async def test_expired_workbook_worker_cannot_publish_or_delete_replacement(
     from httpx import ASGITransport, AsyncClient
     from sqlalchemy import text
 
-    from app import classification_model, main, source_cleanup, workbooks
+    from app import main, source_cleanup
+    from app.features.classification import model as classification_model
+    from app.features.workbooks.routes import router as workbook_router
     from app.checkpoints import setup_checkpoints
     from app.config import settings
     from test_allocation_api import approve_target, fixture_model
@@ -51,7 +53,7 @@ async def test_expired_workbook_worker_cannot_publish_or_delete_replacement(
     await setup_checkpoints(settings)
     paused, release = Event(), Event()
     replacement_app = FastAPI()
-    replacement_app.include_router(workbooks.router)
+    replacement_app.include_router(workbook_router)
     try:
         async with running_service() as first_client:
             source = (FIXTURES / "reconciliation.xlsx").read_bytes()

@@ -5,13 +5,16 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import text
 
-from app import classification_model, reconciliations, source_cleanup, workbooks
-from app import tasks as task_api
+from app import source_cleanup
+from app.features.classification import model as classification_model
+from app.features.reconciliation import use_cases as reconciliations
+from app.features.workbooks import use_cases as workbooks
+from app.features.tasks import use_cases as task_api
 from app.checkpoints import setup_checkpoints
 from app.config import settings
 from app.execution import Unavailable
 from app.source_storage import LocalSourceStorage, StorageError
-from app.workbook_source import WorkbookProblem
+from app.features.workbooks.source import WorkbookProblem
 from test_allocation_api import fixture_model
 from test_classification_api import START, configured_skill
 from test_reconciliation_api import create_source, establish_evidence, success

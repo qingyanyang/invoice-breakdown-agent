@@ -8,13 +8,13 @@ import httpx
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from app import classification_model
-from app.classification_evidence import ClassificationEvidenceError
-from app.classify import Proposal, build_classification, make_evidence
+from app.features.classification import model as classification_model
+from app.features.classification.evidence import ClassificationEvidenceError
+from app.features.classification.calculate import Proposal, build_classification, make_evidence
 from app.config import Settings
-from app.extraction_reader import extract_workbook
-from app.reconcile import reconcile
-from app.rule_retrieval import RuleDocument, search_rules
+from app.features.extraction.reader import extract_workbook
+from app.features.reconciliation.calculate import reconcile
+from app.features.classification.retrieval import RuleDocument, search_rules
 from test_reconciliation import SHEET_NS, SOURCE, WORKSHEET, evidence_for, fixture
 
 SHEET = "Trade Summary"

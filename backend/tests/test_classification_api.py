@@ -5,9 +5,10 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from app import classification_model, classifications
+from app.features.classification import model as classification_model
+from app.features.classification import use_cases as classifications
 from app.checkpoints import setup_checkpoints
-from app.classify import Proposal
+from app.features.classification.calculate import Proposal
 from app.config import settings
 from test_classification import SHEET, component_workbook, write_codex, write_skill
 from test_reconciliation import SHEET_NS, WORKSHEET, source_sheet

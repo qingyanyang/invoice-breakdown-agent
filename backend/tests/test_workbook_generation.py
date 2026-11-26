@@ -7,12 +7,12 @@ from zipfile import ZipFile
 import pytest
 from openpyxl import load_workbook
 
-from app.allocation import AllocationPolicy, allocate
-from app.extraction_reader import extract_workbook
-from app.reconcile import reconcile
-from app.reconciliation_evidence import Reference
-from app.workbook_generation import generate_workbook
-from app.workbook_source import WorkbookProblem
+from app.features.allocation.calculate import AllocationPolicy, allocate
+from app.features.extraction.reader import extract_workbook
+from app.features.reconciliation.calculate import reconcile
+from app.features.extraction.references import Reference
+from app.features.workbooks.generate import generate_workbook
+from app.features.workbooks.source import WorkbookProblem
 from test_allocation_api import TRADE_BY_ROW, add_authorized_option
 from test_reconciliation import SHEET_NS, SOURCE, WORKSHEET, source_sheet
 from test_reconciliation_api import FIXTURES

@@ -11,10 +11,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import settings
 from app.database import DatabaseConfigurationError, create_application_engine
 from app.source_storage import LocalSourceStorage, StorageError, create_output_storage, create_source_storage
-from app.delivery import discard_unreferenced_qa
+from app.features.qa.use_cases import discard_unreferenced_qa
 from app.execution_tables import execution_objects, execution_runs
-from app.tasks import discard_unreferenced
-from app.workbooks import discard_unreferenced_workbook
+from app.features.tasks.use_cases import discard_unreferenced
+from app.features.workbooks.use_cases import discard_unreferenced_workbook
 
 UUID_PATTERN = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
 OBJECT_NAME = rf"(?:{UUID_PATTERN}\.xlsx|(?P<staging>\.{UUID_PATTERN}\.[a-z0-9_]+\.staging))"

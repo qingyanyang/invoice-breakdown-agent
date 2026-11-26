@@ -4,8 +4,8 @@ from xml.sax.saxutils import escape
 
 import pytest
 
-from app.extraction_reader import extract_workbook
-from app.reconcile import reconcile
+from app.features.extraction.reader import extract_workbook
+from app.features.reconciliation.calculate import reconcile
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "invoice_breakdown"
 WORKSHEET = "xl/worksheets/sheet1.xml"
