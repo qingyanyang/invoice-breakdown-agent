@@ -9,7 +9,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import SecretStr
 
 bearer = HTTPBearer(auto_error=False)
-INTERNAL_OPERATOR = "invoice.internal_operator"
 
 
 def operator_credentials(secret: SecretStr | None) -> dict[str, bytes]:
@@ -40,9 +39,6 @@ def require_operator(
     credentials = request.app.state.operator_credentials
     if not credentials:
         raise HTTPException(503, "Operator authentication unavailable")
-    internal = request.scope.get(INTERNAL_OPERATOR)
-    if internal in credentials:
-        return internal
     if authorization is not None:
         provided = sha256(authorization.credentials.encode()).digest()
         matched = None

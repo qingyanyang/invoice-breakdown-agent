@@ -3,8 +3,8 @@ from fractions import Fraction
 
 import pytest
 
-from app.allocation import AllocationPolicy, Scale, allocate
-from app.classify import Trade
+from app.features.allocation.calculate import AllocationPolicy, Scale, allocate
+from app.features.classification.calculate import Trade
 
 TARGET = Decimal("282.54")
 

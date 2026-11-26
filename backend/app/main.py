@@ -7,8 +7,8 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.allocations import router as allocation_router
-from app.classifications import router as classification_router
+from app.features.allocation.routes import router as allocation_router
+from app.features.classification.routes import router as classification_router
 from app.config import settings
 from app.database import (
     DatabaseConfigurationError,
@@ -16,20 +16,21 @@ from app.database import (
     database_heads,
     repository_heads,
 )
-from app.delivery import router as delivery_router
-from app.execution_api import router as execution_router
-from app.extractions import router as extraction_router
+from app.features.qa.routes import router as delivery_router
+from app.features.tasks.execution_routes import router as execution_router
+from app.features.extraction.routes import router as extraction_router
 from app.operators import operator_credentials
-from app.qa_engine import QAEngine
-from app.reconciliations import router as reconciliation_router
-from app.slack.protocol import SlackConfig
-from app.slack.routes import router as slack_router, run_worker as run_slack_worker
+from app.features.qa.engine import QAEngine
+from app.features.reconciliation.routes import router as reconciliation_router
+from app.channels.slack.protocol import SlackConfig
+from app.channels.slack.routes import router as slack_router
+from app.channels.slack.worker import run_worker as run_slack_worker
 from app.source_storage import create_output_storage, create_source_storage
-from app.task_rules import router as task_rule_router
-from app.tasks import router as task_router
+from app.features.tasks.rule_routes import router as task_rule_router
+from app.features.tasks.routes import router as task_router
 from app.worker_io import BlockingWorker, SourceReadWorker
-from app.workbooks import router as workbook_router
-from app.workflows import router as workflow_router
+from app.features.workbooks.routes import router as workbook_router
+from app.workflows.routes import router as workflow_router
 
 logger = logging.getLogger(__name__)
 

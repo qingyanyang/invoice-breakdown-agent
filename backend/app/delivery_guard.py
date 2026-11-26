@@ -3,9 +3,9 @@
 from contextlib import asynccontextmanager
 
 from anyio import CancelScope, fail_after
-from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from app.outcomes import FailureKind, UseCaseError
 
 LOCK = text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))")
 UNLOCK = text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))")
@@ -24,7 +24,7 @@ async def guard_delivery_inputs(connection, task_id):
     # Writers may already hold the task row lock. Try the gate without waiting
     # so the dispatch-side check can acquire the task row after rollback.
     if not await connection.scalar(WRITER_LOCK, guard_key(task_id)):
-        raise HTTPException(503, {"code": "delivery_in_progress", "message": "Retry after the current delivery finishes"})
+        raise UseCaseError(FailureKind.UNAVAILABLE, {"code": "delivery_in_progress", "message": "Retry after the current delivery finishes"})
 
 
 @asynccontextmanager

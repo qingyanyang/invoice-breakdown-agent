@@ -4,7 +4,7 @@ from hashlib import sha256
 
 import pytest
 
-from app.rule_retrieval import RuleDocument, search_rules
+from app.features.classification.retrieval import RuleDocument, search_rules
 
 SPECIFICATION = """# Synthetic approved rules
 

@@ -1,5 +1,8 @@
 # AFLUX Invoice Breakdown Agent backend
 
+See the [backend architecture guide](ARCHITECTURE.md) for feature ownership,
+dependency rules, and compatibility checks.
+
 FastAPI exposes `GET /health` for liveness and `GET /ready` for database readiness. The task API persists source uploads and input revisions. Workbook processing is planned.
 
 ## Local startup

@@ -3,10 +3,18 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.schema import CreateSchema
 
 # Register application tables in the shared metadata.
-from app import allocation_tables, classification_tables, execution_tables, extraction_tables, qa_tables, reconciliation_tables, task_tables, workbook_tables, workflow_tables
+from app import execution_tables
+from app.features.allocation import tables as allocation_tables
+from app.features.classification import tables as classification_tables
+from app.features.extraction import tables as extraction_tables
+from app.features.qa import tables as qa_tables
+from app.features.reconciliation import tables as reconciliation_tables
+from app.features.tasks import tables as task_tables
+from app.features.workbooks import tables as workbook_tables
+from app.workflows import tables as workflow_tables
 from app.config import settings
 from app.database import create_database_engine, metadata
-from app.slack import tables as slack_tables
+from app.channels.slack import tables as slack_tables
 
 schema = settings.postgres_schema
 

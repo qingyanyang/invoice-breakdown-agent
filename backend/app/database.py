@@ -14,6 +14,7 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import Settings, settings
+from app.outcomes import FailureKind, UseCaseError
 
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 CONNECT_TIMEOUT_SECONDS = 3
@@ -29,6 +30,13 @@ metadata = MetaData(schema=settings.postgres_schema)
 
 class DatabaseConfigurationError(RuntimeError):
     """A database setting is unusable. Its value is safe to omit from diagnostics."""
+
+
+def database_for(resources) -> AsyncEngine:
+    engine = resources.database_engine
+    if engine is None:
+        raise UseCaseError(FailureKind.UNAVAILABLE, "Task database unavailable")
+    return engine
 
 
 def database_url(config: Settings) -> URL:

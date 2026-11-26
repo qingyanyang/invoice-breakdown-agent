@@ -5,12 +5,12 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from fastapi import HTTPException
+from app.outcomes import FailureKind, UseCaseError
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import SQLAlchemyError
 
 from app import main, source_cleanup
-from app import tasks as task_api
+from app.features.tasks import use_cases as task_api
 from app.source_storage import LocalSourceStorage, StorageError
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "invoice_breakdown"
@@ -148,7 +148,7 @@ async def test_uncertain_commit_keeps_referenced_source(task_runtime, monkeypatc
         async with original_transaction(engine) as connection:
             yield connection
         if transaction_number == 2:
-            raise HTTPException(503, "Task database unavailable")
+            raise UseCaseError(FailureKind.UNAVAILABLE, "Task database unavailable")
 
     async with running_service() as client:
         task_id = (await create_task(client))["id"]

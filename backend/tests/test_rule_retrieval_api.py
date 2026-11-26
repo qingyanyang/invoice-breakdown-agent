@@ -7,9 +7,11 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import select, update
 
-from app import classification_model, main, rule_retrieval
+from app import main
+from app.features.classification import model as classification_model
+from app.features.classification import retrieval as rule_retrieval
 from app.checkpoints import setup_checkpoints
-from app.classification_tables import source_classifications
+from app.features.classification.tables import source_classifications
 from app.config import settings
 from test_allocation_api import fixture_model
 from test_classification import write_codex

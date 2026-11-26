@@ -16,18 +16,19 @@ from openpyxl import Workbook, load_workbook
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-from app import classification_model, main
-from app.allocation import AllocationPolicy, allocate
+from app import main
+from app.features.classification import model as classification_model
+from app.features.allocation.calculate import AllocationPolicy, allocate
 from app.checkpoints import setup_checkpoints
 from app.config import settings
-from app.extraction_reader import extract_workbook
-from app.qa_checks import CHECKS, MACHINE_CHECKS, actual_errors
-from app.qa_engine import EngineResult, EngineUnavailable, QAEngine, decode_result
-from app.qa_packages import S, QAProblem, QABook, candidate_from_calculation, remove_values, strip_formula_caches
-from app.qa_preview import MARKER_START, measure_copy, preview_witnesses, verify_preview
-from app.reconcile import reconcile
-from app.reconciliation_evidence import Reference
-from app.workbook_generation import generate_workbook
+from app.features.extraction.reader import extract_workbook
+from app.features.qa.checks import CHECKS, MACHINE_CHECKS, actual_errors
+from app.features.qa.engine import EngineResult, EngineUnavailable, QAEngine, decode_result
+from app.features.qa.packages import S, QAProblem, QABook, candidate_from_calculation, remove_values, strip_formula_caches
+from app.features.qa.preview import MARKER_START, measure_copy, preview_witnesses, verify_preview
+from app.features.reconciliation.calculate import reconcile
+from app.features.extraction.references import Reference
+from app.features.workbooks.generate import generate_workbook
 from test_allocation_api import TRADE_BY_ROW, allocation_workbook, approve_target, fixture_model, reconcile_and_classify
 from test_classification_api import START, configured_skill
 from test_reconciliation import SOURCE
