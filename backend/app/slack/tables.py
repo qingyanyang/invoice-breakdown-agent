@@ -52,5 +52,6 @@ files = Table(
     Column("thread_key", String(64), ForeignKey("slack_threads.key"), nullable=False),
     Column("file_id", String(64), nullable=False),
     Column("state", String(20), nullable=False),
+    Column("retry_at", DateTime(timezone=True)),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )

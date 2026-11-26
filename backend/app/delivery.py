@@ -15,6 +15,7 @@ from sqlalchemy import insert, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
+from app.delivery_guard import guard_delivery_inputs
 from app.execution import (
     ExecutionFailure, acquire, claim, executing, fence, object_may_be_discarded, register_object, settle,
     write_registered_object,
@@ -361,6 +362,7 @@ async def start_qa(task_id: UUID, payload: QARequest, request: Request, operator
                 if latest["sha256"] != artifact["sha256"] or (present["id"] if present else None) != previous_id:
                     raise HTTPException(409, "The current QA evidence has changed")
                 await fence(connection, attempt)
+                await guard_delivery_inputs(connection, task_id)
                 values = {
                     "id": run_id, "artifact_id": latest["artifact_id"], "artifact_sha256": latest["sha256"],
                     "qa_version": QA_VERSION, "status": current_status(computed.checks), "checks": computed.checks,
@@ -454,6 +456,7 @@ async def accept_visual_review(
         if (receipt := await reserve_receipt(connection, key)) is not None:
             return receipt
         require_visual_review(run, payload)
+        await guard_delivery_inputs(connection, task_id)
         approval = {
             "operator": operator, "reviewed_at": datetime.now(UTC).isoformat(),
             "candidate_sha256": payload.candidate_sha256, "preview_sha256": payload.preview_sha256,

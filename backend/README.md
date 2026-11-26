@@ -708,7 +708,9 @@ and QA checks as the HTTP API.
    `shasum -a 256` with the candidate checksum in the owner QA response.
    Check the Chinese summary and verify the final reconciliation difference.
 5. When the bot reports a retryable failure or `delivery_unknown`, send
-   `retry` in the original upload thread. The latter checks the stored
+   `retry` in the original upload thread. A task waiting on its first
+   source resumes with the original attachment and upload receipt.
+   For `delivery_unknown`, the adapter checks the stored
    Slack file ID. If its destination and share remain unconfirmed, ask the
    test workspace administrator to inspect that original upload.
 
@@ -718,8 +720,14 @@ are excluded. Slack is disabled by default. The app stores normalized
 events, thread bindings, review controls, and file IDs in PostgreSQL. One
 worker per deployment processes events across replicas. PostgreSQL
 serializes the worker while workflow stages run outside the inbox
-transaction. A lost file completion response never causes an automatic
-second upload. Set up access to the test database and Slack workspace
+transaction. Core HTTP 202 and Slack rate limits defer the event according
+to `Retry-After`, within a 30-minute deferral window. An explicit Slack
+429 during completion schedules another completion using the same file
+ID. A lost response leaves the receipt at `delivery_unknown` until Slack
+confirms the original share. During final dispatch, a short database
+session lock protects the approved revision and QA inputs. A competing
+task change can be retried after dispatch finishes. Set up access to the
+test database and Slack workspace
 according to their synthetic data retention policies.
 
 Run the automated tests with

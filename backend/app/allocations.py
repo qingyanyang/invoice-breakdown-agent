@@ -18,6 +18,7 @@ from app.allocation import ALLOCATION_VERSION, AllocationPolicy, allocate
 from app.allocation_tables import source_allocations
 from app.classifications import ClassificationDetails, classification_inputs, classification_record, identity
 from app.config import settings
+from app.delivery_guard import guard_delivery_inputs
 from app.execution import ExecutionFailure, acquire, claim, executing, fence, settle
 from app.extractions import ExtractionDetails
 from app.operators import Operator
@@ -148,6 +149,7 @@ async def run_allocation(
             if current_fingerprint != fingerprint or (current.allocation_id if current else None) != prior_id:
                 raise HTTPException(409, "The allocation inputs or approval have changed")
             await fence(connection, attempt)
+            await guard_delivery_inputs(connection, task_id)
             fields = {
                 "allocation_id": uuid4(), "allocator_version": ALLOCATION_VERSION,
                 "input_sha256": fingerprint, "operator": operator,

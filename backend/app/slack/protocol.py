@@ -5,7 +5,10 @@ import hmac
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from html import escape
+from math import ceil
 from time import time
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -170,6 +173,24 @@ class SlackError(Exception):
         super().__init__(code)
 
 
+def retry_after_seconds(value):
+    if value and re.fullmatch(r"[0-9]{1,8}", value):
+        return max(1, int(value))
+    if value:
+        try:
+            timestamp = parsedate_to_datetime(value)
+            return max(1, ceil((timestamp - datetime.now(UTC)).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return 1
+
+
+class SlackRateLimited(SlackError):
+    def __init__(self, delay):
+        super().__init__("slack_rate_limited", retryable=True)
+        self.delay = delay
+
+
 def checked_url(value):
     if not isinstance(value, str) or len(value) > 4096:
         raise SlackError("slack_file_url_invalid")
@@ -196,13 +217,17 @@ class SlackClient:
             with fail_after(12):
                 encoding = {"data" if form else "json": payload}
                 response = await self.client.post(SLACK_API + method, headers=self.authorization, **encoding)
+                if response.status_code == 429:
+                    raise SlackRateLimited(retry_after_seconds(response.headers.get("Retry-After")))
                 if response.is_error:
-                    raise SlackError("slack_api_unavailable", retryable=response.status_code >= 500 or response.status_code == 429)
+                    raise SlackError("slack_api_unavailable", retryable=response.status_code >= 500)
                 result = as_dict(response.json())
         except (httpx.HTTPError, TimeoutError, ValueError):
             raise SlackError("slack_api_unavailable", retryable=True) from None
         if not result.get("ok"):
-            retryable = result.get("error") in {"ratelimited", "internal_error", "service_unavailable"}
+            if result.get("error") == "ratelimited":
+                raise SlackRateLimited(retry_after_seconds(response.headers.get("Retry-After")))
+            retryable = result.get("error") in {"internal_error", "service_unavailable"}
             raise SlackError("slack_api_rejected", retryable=retryable)
         return result
 

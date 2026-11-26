@@ -7,13 +7,16 @@ from urllib.parse import unquote
 from uuid import UUID
 
 from anyio import to_thread
+from fastapi import HTTPException
 from pdfminer.pdfpage import PDFPage
 from pdfminer.psexceptions import PSException
 
-from app.request_receipts import fingerprint
+from app.delivery import approved_for_delivery, current_status, get_current_run
+from app.delivery_guard import DeliveryBusy, hold_delivery_guard
 from app.reconciliation_evidence import Reference
+from app.request_receipts import fingerprint
 from app.slack.core import CoreError
-from app.slack.protocol import SlackError
+from app.slack.protocol import SlackError, SlackRateLimited
 from app.slack.store import Store
 from app.workbook_upload import XLSX_MEDIA_TYPE
 
@@ -52,6 +55,7 @@ def notice_for(error):
         "review_preview_incomplete": "审核预览缺页或页码不完整。请重新运行当前工作簿的 QA。",
         "stale_control": "此操作不适用于当前任务或修订。请使用当前问题或预览中的按钮。",
         "empty_file_selection": "请在私聊中单独上传一份合成 .xlsx 文件。",
+        "event_deferral_exhausted": "等待重试的时间上限已到。请在原任务消息串发送 retry。",
     }.get(error, "Slack 操作暂未完成。请在原任务消息串发送 retry，或联系管理员。")
 
 
@@ -78,6 +82,18 @@ def preview_sheets(coverage, pdf):
         return {sheet: sorted(pages) for sheet, pages in sheets.items()}
     except (ValueError, KeyError, TypeError, PSException):
         raise SlackError("review_preview_incomplete") from None
+
+
+def question_evidence(entries):
+    for entry in entries:
+        if isinstance(entry, str):
+            yield entry
+        elif isinstance(entry, dict):
+            coordinate = entry.get("reference", entry)
+            if isinstance(coordinate, dict) and all(isinstance(coordinate.get(key), str) for key in ("sheet", "cell")):
+                details = [Reference.from_dict(coordinate).key]
+                details.extend(entry[key] for key in ("description", "gst_basis") if isinstance(entry.get(key), str))
+                yield " · ".join(details)
 
 
 class Conversation:
@@ -123,9 +139,12 @@ class Conversation:
             return
         text = self.event["text"].strip()
         if self.event["root"] and self.event["files"]:
-            await self.upload(text, self.event["files"])
-        elif self.thread and self.revision > 1 and text.casefold() == "retry":
-            await self.advance()
+            await self.upload(text, self.event["files"], self.event_key)
+        elif self.thread and text.casefold() == "retry":
+            if self.revision == 1:
+                await self.resume_upload()
+            else:
+                await self.advance()
         elif self.thread and (reason := REASON.fullmatch(text)):
             await self.action(reason[1], reason[2].strip())
         elif text.casefold() == "breakdown":
@@ -133,24 +152,31 @@ class Conversation:
         else:
             await self.tell(OUT_OF_SCOPE)
 
-    async def upload(self, text, file_ids):
+    async def resume_upload(self):
+        source_key = self.thread["binding"]["source_event"]
+        event = await self.store.source_event(source_key)
+        if not event or event["kind"] != "message" or not event["root"] or event["binding"] != self.binding:
+            raise SlackError("stale_control")
+        await self.upload(event["text"].strip(), event["files"], source_key)
+
+    async def upload(self, text, file_ids, source_key):
         if len(file_ids) != 1:
             raise SlackError("empty_file_selection")
         target = parse_target(text)
-        if self.thread is not None and self.thread["binding"]["source_event"] != self.event_key:
+        if self.thread is not None and self.thread["binding"]["source_event"] != source_key:
             raise SlackError("stale_control")
         if self.thread is None or self.revision == 1:
             name, data = await self.slack.source(file_ids[0], self.binding)
             if sha256(data).hexdigest() not in self.config.samples:
                 raise SlackError("demo_source_unapproved")
             if self.thread is None:
-                task = await self.core.json("POST", "/tasks", json={"target": target}, action=[self.event_key, "create"])
-                await self.store.bind_task(UUID(task["id"]), task["revision"], self.event_key)
+                task = await self.core.json("POST", "/tasks", json={"target": target}, action=[source_key, "create"])
+                await self.store.bind_task(UUID(task["id"]), task["revision"], source_key)
                 self.thread = await self.store.thread()
             uploaded = await self.core.json(
                 "PUT", self.path + "/source", content=data, headers={"Content-Type": XLSX_MEDIA_TYPE},
                 params={"expected_revision": self.revision, "filename": name},
-                action=[self.event_key, "upload"],
+                action=[source_key, "upload"],
             )
             await self.store.set_uploaded(self.revision, uploaded["revision"])
             self.thread = await self.store.thread()
@@ -166,9 +192,12 @@ class Conversation:
         for item in questions:
             options = item["options"]
             prompt = item["prompt"]
-            evidence = [Reference.from_dict(ref).key if isinstance(ref, dict) else ref for ref in item.get("evidence", [])]
+            if item.get("required_evidence"):
+                prompt += "\n" + item["required_evidence"]
+            evidence = list(question_evidence(item.get("evidence", [])))
             if evidence:
-                prompt += "\n来源：" + "、".join(evidence[:10])
+                prompt += "\n来源：" + "\n".join(evidence[:10])
+            prompt = prompt[:2400]
             if not options:
                 await self.tell("流程暂停。" + prompt)
                 continue
@@ -361,22 +390,54 @@ class Conversation:
         if prior and prior["state"] == "delivery_unknown":
             await self.confirm_delivery(key, prior["file_id"])
             return
-        file_id, url = await self.slack.stage_file(name, len(content))
-        if not await self.store.stage_file(key, file_id):
-            raise SlackError("delivery_unknown")
-        await self.slack.upload_bytes(url, content)
+        if prior and prior["state"] == "share_retry":
+            if prior["retry_wait"] > 0:
+                raise SlackRateLimited(int(prior["retry_wait"]))
+            file_id = prior["file_id"]
+        else:
+            file_id, url = await self.slack.stage_file(name, len(content))
+            if not await self.store.stage_file(key, file_id):
+                raise SlackError("delivery_unknown")
+            await self.slack.upload_bytes(url, content)
         await self.current_qa(identity, status)
         await self.slack.verify_dm(self.binding)
-        # The response can be lost or the process can stop during completion.
-        # Persist uncertainty first so recovery keeps the original Slack file ID.
-        if not await self.store.transition_file(key, file_id, {"staged"}, "delivery_unknown"):
-            raise SlackError("delivery_unknown")
         try:
-            await self.slack.share_file(file_id, name, self.binding, caption)
-        except SlackError:
-            await self.confirm_delivery(key, file_id)
-        else:
-            await self.store.transition_file(key, file_id, {"delivery_unknown"}, "sent")
+            async with hold_delivery_guard(self.store.engine, self.thread["task_id"]):
+                await self.verify_dispatch(identity, status)
+                if not await self.store.transition_file(key, file_id, {"staged", "share_retry"}, "delivery_unknown"):
+                    raise SlackError("delivery_unknown")
+                try:
+                    await self.slack.share_file(file_id, name, self.binding, caption)
+                except SlackRateLimited as error:
+                    await self.store.transition_file(key, file_id, {"delivery_unknown"}, "share_retry", delay=error.delay)
+                    raise
+                except SlackError:
+                    # The receipt stays unknown until Slack confirms the share.
+                    pass
+                else:
+                    await self.store.transition_file(key, file_id, {"delivery_unknown"}, "sent")
+                    return
+        except DeliveryBusy:
+            raise SlackError("delivery_busy", retryable=True) from None
+        await self.confirm_delivery(key, file_id)
+
+    async def verify_dispatch(self, identity, status):
+        try:
+            _, artifact, run = await get_current_run(
+                self.store.engine, self.thread["task_id"], self.binding["operator"],
+            )
+        except HTTPException as error:
+            if error.status_code in {404, 409}:
+                raise SlackError("stale_control") from None
+            raise
+        if (
+            artifact["revision"] != identity["revision"] or str(artifact["artifact_id"]) != identity["expected_artifact_id"]
+            or str(run["id"]) != identity["expected_qa_id"] or current_status(run["checks"]) != status
+            or not run["candidate"] or run["candidate"]["sha256"] != identity["candidate_sha256"]
+            or not run["preview"] or run["preview"]["sha256"] != identity["preview_sha256"]
+            or (status == "ready_for_delivery" and not approved_for_delivery(run))
+        ):
+            raise SlackError("stale_control")
 
     async def confirm_delivery(self, key, file_id):
         try:

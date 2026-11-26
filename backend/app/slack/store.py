@@ -10,6 +10,7 @@ from app.slack.tables import controls, files, inbox, threads, visual_votes
 from app.tasks import transaction
 
 MAX_EVENT_ATTEMPTS = 3
+MAX_EVENT_DEFERRAL = timedelta(minutes=30)
 
 
 async def enqueue(engine, key, event):
@@ -49,6 +50,17 @@ async def finish_event(engine, row, state, error=None):
         ))
 
 
+async def defer_event(engine, row, delay, code):
+    async with transaction(engine) as connection:
+        available = func.now() + timedelta(seconds=delay)
+        return await connection.scalar(update(inbox).where(
+            inbox.c.key == row["key"], inbox.c.state == "running", inbox.c.attempts == row["attempts"],
+            available <= inbox.c.created_at + MAX_EVENT_DEFERRAL,
+        ).values(
+            state="queued", attempts=inbox.c.attempts - 1, available_at=available, error=code,
+        ).returning(inbox.c.key)) is not None
+
+
 class Store:
     def __init__(self, engine, binding):
         self.engine = engine
@@ -73,6 +85,10 @@ class Store:
             await connection.execute(update(threads).where(
                 threads.c.key == self.thread_key, threads.c.revision == expected,
             ).values(revision=revision))
+
+    async def source_event(self, key):
+        async with transaction(self.engine) as connection:
+            return await connection.scalar(select(inbox.c.event).where(inbox.c.key == key))
 
     async def create_control(self, payload):
         key = fingerprint([self.thread_key, payload])
@@ -99,7 +115,8 @@ class Store:
 
     async def file(self, key):
         async with transaction(self.engine) as connection:
-            return (await connection.execute(select(files).where(
+            wait = func.ceil(func.extract("epoch", files.c.retry_at - func.now())).label("retry_wait")
+            return (await connection.execute(select(files, wait).where(
                 files.c.key == key, files.c.thread_key == self.thread_key,
             ))).mappings().one_or_none()
 
@@ -115,9 +132,12 @@ class Store:
             ).returning(files.c.file_id))
             return accepted == file_id
 
-    async def transition_file(self, key, file_id, allowed, state):
+    async def transition_file(self, key, file_id, allowed, state, *, delay=None):
         async with transaction(self.engine) as connection:
             return await connection.scalar(update(files).where(
                 files.c.key == key, files.c.thread_key == self.thread_key, files.c.file_id == file_id,
                 files.c.state.in_(allowed),
-            ).values(state=state, updated_at=func.now()).returning(files.c.file_id)) == file_id
+            ).values(
+                state=state, updated_at=func.now(),
+                retry_at=func.now() + timedelta(seconds=delay) if delay is not None else None,
+            ).returning(files.c.file_id)) == file_id

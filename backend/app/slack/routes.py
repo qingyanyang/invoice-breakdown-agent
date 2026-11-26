@@ -9,10 +9,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import settings
-from app.slack.core import Core, CoreError
-from app.slack.protocol import SlackClient, SlackError, authenticated_payload, normalize
+from app.slack.core import Core, CoreError, CorePending
+from app.slack.protocol import SlackClient, SlackError, SlackRateLimited, authenticated_payload, normalize
 from app.slack.service import Conversation, notice_for
-from app.slack.store import MAX_EVENT_ATTEMPTS, claim_event, enqueue, finish_event
+from app.slack.store import MAX_EVENT_ATTEMPTS, claim_event, defer_event, enqueue, finish_event
 from app.tasks import database_for
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,11 @@ async def process_event(app, slack, config, row):
     try:
         with fail_after(EVENT_TIMEOUT):
             await conversation.handle()
+    except (CorePending, SlackRateLimited) as error:
+        waiting = error.code if isinstance(error, SlackRateLimited) else "core_execution_pending"
+        if await defer_event(engine, row, error.delay, waiting):
+            return
+        code, retryable, notice = "event_deferral_exhausted", False, notice_for("event_deferral_exhausted")
     except SlackError as error:
         code, retryable, notice = error.code, error.retryable, notice_for(error.code)
     except CoreError as error:

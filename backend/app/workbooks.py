@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.allocations import AllocationInputs, allocation_record, current_inputs
 from app.config import settings
+from app.delivery_guard import guard_delivery_inputs
 from app.execution import (
     ExecutionFailure, acquire, claim, executing, fence, object_may_be_discarded, register_object, settle,
     write_registered_object,
@@ -242,6 +243,7 @@ async def create_workbook(task_id: UUID, payload: WorkbookRequest, request: Requ
                     select(func.max(workbook_artifacts.c.version)).where(workbook_artifacts.c.task_id == task_id)
                 )
                 version = (latest_version or 0) + 1
+                await guard_delivery_inputs(connection, task_id)
                 result = await connection.execute(insert(workbook_artifacts).values(
                     **current.identity, artifact_id=artifact_id, version=version, storage_key=key, size=size, sha256=checksum,
                     filename=filename_for(generated.project_name, revision["source_filename"], revision["revision"], version),

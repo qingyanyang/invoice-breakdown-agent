@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.config import settings
+from app.delivery_guard import guard_delivery_inputs
 from app.execution import ExecutionFailure, acquire, claim, executing, fence, settle
 from app.extractions import ExtractionDetails, extraction_record
 from app.operators import Operator
@@ -192,6 +193,7 @@ async def apply_reconciliation(task_id, payload, request, operator, idempotency_
             if current_extraction != extraction or current != previous:
                 raise HTTPException(409, "Reconciliation inputs have changed")
             await fence(connection, attempt)
+            await guard_delivery_inputs(connection, task_id)
             result = await record_outcome(connection, extraction, scope, decisions, report)
             await save_receipt(connection, key, result)
             await settle(

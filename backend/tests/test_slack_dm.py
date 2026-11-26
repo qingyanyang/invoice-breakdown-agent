@@ -10,11 +10,13 @@ import pytest
 from anyio import sleep_forever
 from pydantic import SecretStr
 from pypdf import PdfWriter
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
 from app import classification_model, main
 from app.checkpoints import setup_checkpoints
 from app.config import settings
+from app.slack import routes, store
+from app.slack.core import Core
 from app.slack.protocol import SlackClient, SlackError
 from app.slack.routes import process_one
 from app.slack.service import OUT_OF_SCOPE, preview_sheets
@@ -22,6 +24,7 @@ from app.slack.tables import files, inbox, threads
 from app.task_tables import tasks
 from test_allocation_api import fixture_model
 from test_classification_api import configured_skill
+from test_reconciliation import WORKSHEET, source_sheet
 from test_reconciliation_api import ALICE, FIXTURES, service, success
 from test_workbook_qa import real_engine
 
@@ -97,6 +100,11 @@ class FakeSlack:
         self.download_url = "https://files.slack.com/private/sample"
         self.final_visibility = False
         self.final_completion_attempts = 0
+        self.final_completions = []
+        self.rate_limit_once = False
+        self.lose_final_response = True
+        self.before_final_dispatch = None
+        self.during_final_dispatch = None
 
     def button(self, label):
         return next(
@@ -134,6 +142,9 @@ class FakeSlack:
             return self.ok(file_id=file_id, upload_url=f"https://files.slack.com/upload/{file_id}")
         payload = json.loads(request.content)
         if method == "conversations.info":
+            if self.before_final_dispatch and any(self.staged[file_id].endswith(".xlsx") for file_id in self.uploads):
+                hook, self.before_final_dispatch = self.before_final_dispatch, None
+                await hook()
             return self.ok(channel={"id": payload["channel"], "user": USER, "is_im": True})
         if method == "chat.postMessage":
             self.messages.append(payload)
@@ -157,10 +168,17 @@ class FakeSlack:
             assert file_id in self.uploads
             assert payload["channel_id"] == CHANNEL and payload["thread_ts"] == THREAD
             if self.staged[file_id].endswith(".xlsx"):
-                # Slack shares the correct file, but the client loses its response.
                 self.final_completion_attempts += 1
-                self.shared[file_id] = payload
-                raise httpx.ReadTimeout("mock lost response", request=request)
+                self.final_completions.append(file_id)
+                if self.during_final_dispatch:
+                    await self.during_final_dispatch()
+                if self.rate_limit_once:
+                    self.rate_limit_once = False
+                    return httpx.Response(429, headers={"Retry-After": "41"})
+                if self.lose_final_response:
+                    # Slack shares the correct file, but the client loses its response.
+                    self.shared[file_id] = payload
+                    raise httpx.ReadTimeout("mock lost response", request=request)
             self.shared[file_id] = payload
             return self.ok(files=[{"id": file_id}])
         pytest.fail(f"Unexpected Slack method {method}")
@@ -317,3 +335,204 @@ def test_multi_page_visual_control_requires_complete_preview_coverage():
     coverage[0]["pages"] = [1]
     with pytest.raises(SlackError, match="review_preview_incomplete"):
         preview_sheets(coverage, output.getvalue())
+
+
+def intercept_core(monkeypatch, hook):
+    class InterceptedCore(Core):
+        def __init__(self, app, operator):
+            super().__init__(app, operator)
+            original = self.client.request
+
+            async def request(method, path, **kwargs):
+                response = await hook(method, path, kwargs)
+                return response if response is not None else await original(method, path, **kwargs)
+
+            self.client.request = request
+
+    monkeypatch.setattr(routes, "Core", InterceptedCore)
+
+
+async def make_retries_due(*, file_retry=False):
+    async with main.app.state.database_engine.begin() as connection:
+        await connection.execute(update(inbox).where(inbox.c.state == "queued").values(available_at=func.now()))
+        if file_retry:
+            await connection.execute(update(files).where(files.c.state == "share_retry").values(retry_at=func.now()))
+
+
+async def post_event(client, payload, *, form=False):
+    response = await client.post("/integrations/slack/events", **signed(payload, form=form))
+    assert response.status_code == 200, response.text
+
+
+async def start_review(client, fake, engine):
+    main.app.state.qa_engine = engine
+    await post_event(client, event("EvPrepare", file_id="FSOURCE", caption="breakdown target 282.54 ex_gst"))
+    await drain(fake)
+    linked, = await rows(threads)
+    path = f"/tasks/{linked['task_id']}"
+    assert success(await client.get(path + "/delivery/qa", headers=ALICE))["status"] == "awaiting_visual_review"
+    for control in fake.matching_buttons("确认已审阅全部页面"):
+        await post_event(client, interaction(control), form=True)
+    return path
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("timing", ["recipient_check", "completion_in_flight"])
+async def test_final_share_is_serialized_with_task_revision_changes(
+    slack_demo, configured_skill, real_engine, monkeypatch, timing,
+):
+    monkeypatch.setattr(classification_model, "propose", fixture_model)
+    await setup_checkpoints(settings)
+    fake = FakeSlack(slack_demo)
+    fake.lose_final_response = False
+    async with service() as client:
+        path = await start_review(client, fake, real_engine)
+        changed = []
+        payload = {"expected_revision": 2, "target": {"amount": "285.00", "gst_basis": "excluding_gst"}}
+
+        async def change():
+            changed.append(await client.put(path + "/target", json=payload, headers=ALICE))
+
+        if timing == "recipient_check":
+            fake.before_final_dispatch = change
+        else:
+            fake.during_final_dispatch = change
+        await drain(fake)
+        attempt, = changed
+        if timing == "recipient_check":
+            assert success(attempt)["revision"] == 3
+            assert fake.final_completions == []
+            assert any(row["error"] == "stale_control" for row in await rows(inbox))
+            assert (await client.get(path + "/delivery/download", headers=ALICE)).status_code == 409
+        else:
+            assert attempt.status_code == 503
+            assert attempt.json()["detail"]["code"] == "delivery_in_progress"
+            final, = fake.final_completions
+            assert fake.uploads[final] == (await client.get(path + "/delivery/download", headers=ALICE)).content
+            assert success(await client.put(path + "/target", json=payload, headers=ALICE))["revision"] == 3
+
+
+@pytest.mark.anyio
+async def test_core_accepted_status_defers_same_event_and_receipt_until_due(slack_demo, monkeypatch):
+    receipts = []
+
+    async def pending(method, path, kwargs):
+        if method == "POST" and path.endswith("/workflow"):
+            receipts.append(kwargs["headers"]["Idempotency-Key"])
+            if len(receipts) == 1:
+                return httpx.Response(
+                    202, headers={"Retry-After": "37"}, json={"detail": {"status": "running", "execution_id": "synthetic"}},
+                )
+
+    intercept_core(monkeypatch, pending)
+    await setup_checkpoints(settings)
+    fake = FakeSlack(slack_demo)
+    async with service() as client:
+        await post_event(client, event("EvCorePending", file_id="FSOURCE", caption="breakdown target 282.54"))
+        await drain(fake)
+        queued, = await rows(inbox)
+        assert queued["state"] == "queued" and queued["error"] == "core_execution_pending"
+        assert queued["attempts"] == 0
+        assert (queued["available_at"] - queued["created_at"]).total_seconds() >= 37
+        assert fake.messages == [] and fake.staged == {}
+        await drain(fake)
+        assert len(receipts) == 1
+
+    async with service() as client:
+        await make_retries_due()
+        await drain(fake)
+        assert len(receipts) == 2 and receipts[0] == receipts[1]
+        assert fake.button("ex_gst")
+        done, = await rows(inbox)
+        assert done["state"] == "done"
+        assert len(await rows(tasks)) == 1
+
+
+@pytest.mark.anyio
+async def test_pending_upload_reuses_bound_source_event_and_core_receipt(slack_demo, monkeypatch):
+    monkeypatch.setattr(routes, "MAX_EVENT_ATTEMPTS", 1)
+    monkeypatch.setattr(store, "MAX_EVENT_ATTEMPTS", 1)
+    upload_keys = []
+
+    async def unavailable(method, path, kwargs):
+        if method == "PUT" and path.endswith("/source"):
+            upload_keys.append(kwargs["headers"]["Idempotency-Key"])
+            if len(upload_keys) == 1:
+                return httpx.Response(503, json={"detail": "Temporary source storage problem"})
+
+    intercept_core(monkeypatch, unavailable)
+    await setup_checkpoints(settings)
+    fake = FakeSlack(slack_demo)
+    async with service() as client:
+        await post_event(client, event("EvPendingUpload", file_id="FSOURCE", caption="breakdown target 282.54"))
+        await drain(fake)
+        original, = await rows(threads)
+        assert original["revision"] == 1
+        assert any("retry" in message["text"] for message in fake.messages)
+
+    async with service() as client:
+        await post_event(client, event("EvResumeUpload", caption="retry", thread=THREAD))
+        await drain(fake)
+        resumed, = await rows(threads)
+        assert resumed["task_id"] == original["task_id"] and resumed["revision"] == 2
+        assert len(await rows(tasks)) == 1 and len(upload_keys) == 2 and upload_keys[0] == upload_keys[1]
+        path = f"/tasks/{resumed['task_id']}"
+        assert success(await client.get(path + "/workflow", headers=ALICE))["status"] == "awaiting_clarification"
+
+
+@pytest.mark.anyio
+async def test_reconciliation_question_shows_nested_candidate_evidence_and_accepts_original_option(
+    slack_demo, configured_skill, monkeypatch, workbook_with,
+):
+    sample = workbook_with({WORKSHEET: source_sheet([
+        ("Base work", "75", None),
+        ("Sheet Total ex GST", "75", "D4"),
+        ("Option: Alternative Total", "90", "D4"),
+        ("Project Total ex GST", "75", "D4"),
+        ("Final Total ex GST", "75", "D4"),
+        ("Project Total incl GST", "82.50", "D4"),
+    ])})
+    monkeypatch.setattr(settings, "slack_demo_source_sha256", hashlib.sha256(sample).hexdigest())
+    await setup_checkpoints(settings)
+    fake = FakeSlack(sample)
+    async with service() as client:
+        await post_event(client, event("EvReconcile", file_id="FSOURCE"))
+        await drain(fake)
+        question, = [message for message in fake.messages if "Trade Summary!D7" in message["text"]]
+        assert "Trade Summary!D7 · Project Total ex GST · excluding_gst" in question["text"]
+        assert "Trade Summary!D8 · Final Total ex GST · excluding_gst" in question["text"]
+        await post_event(client, interaction(fake.button("Trade Summary!D7")), form=True)
+        await drain(fake)
+        linked, = await rows(threads)
+        path = f"/tasks/{linked['task_id']}/reconciliation"
+        reconciled = success(await client.get(path, headers=ALICE))
+        assert reconciled["status"] == "ready_for_classification"
+        assert reconciled["decisions"]["source_control"]["answer"] == "Trade Summary!D7"
+
+
+@pytest.mark.anyio
+async def test_slack_completion_rate_limit_retries_original_file_only_after_backoff(
+    slack_demo, configured_skill, real_engine, monkeypatch,
+):
+    monkeypatch.setattr(classification_model, "propose", fixture_model)
+    await setup_checkpoints(settings)
+    fake = FakeSlack(slack_demo)
+    fake.rate_limit_once = True
+    fake.lose_final_response = False
+    async with service() as client:
+        path = await start_review(client, fake, real_engine)
+        await drain(fake)
+        rate_limited, = [row for row in await rows(files) if row["state"] == "share_retry"]
+        file_id = rate_limited["file_id"]
+        assert (rate_limited["retry_at"] - rate_limited["updated_at"]).total_seconds() == 41
+        assert fake.final_completions == [file_id] and file_id not in fake.shared
+        assert any(row["state"] == "queued" and row["error"] == "slack_rate_limited" for row in await rows(inbox))
+        await post_event(client, event("EvEarlyRetry", thread=THREAD, caption="retry"))
+        await drain(fake)
+        assert fake.final_completions == [file_id] and len(fake.staged) == 2
+        await make_retries_due(file_retry=True)
+        await drain(fake)
+        assert fake.final_completions == [file_id, file_id]
+        assert len(fake.staged) == 2 and file_id in fake.shared
+        assert all(row["state"] == "sent" for row in await rows(files))
+        assert fake.uploads[file_id] == (await client.get(path + "/delivery/download", headers=ALICE)).content

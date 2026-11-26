@@ -4,6 +4,7 @@ import httpx
 
 from app.operators import INTERNAL_OPERATOR
 from app.request_receipts import fingerprint
+from app.slack.protocol import retry_after_seconds
 
 
 class CoreError(Exception):
@@ -13,6 +14,12 @@ class CoreError(Exception):
         self.code = code
         self.detail = detail
         super().__init__(step)
+
+
+class CorePending(Exception):
+    def __init__(self, delay):
+        self.delay = delay
+        super().__init__("core_execution_pending")
 
 
 class Core:
@@ -33,6 +40,8 @@ class Core:
             headers = {**kwargs.pop("headers", {}), "Idempotency-Key": "slack-" + fingerprint(action)}
             kwargs["headers"] = headers
         response = await self.client.request(method, path, **kwargs)
+        if response.status_code == 202:
+            raise CorePending(retry_after_seconds(response.headers.get("Retry-After")))
         if response.is_error:
             try:
                 detail = response.json().get("detail")
