@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     azure_storage_documents_container: str = "documents"
     azure_storage_processed_documents_container: str = "processed-documents"
 
+    slack_enabled: bool = False
+    slack_team_id: str | None = None
+    slack_app_id: str | None = None
+    slack_signing_secret: SecretStr | None = None
+    slack_bot_token: SecretStr | None = None
+    slack_operator_map: str = "{}"
+    slack_demo_source_sha256: str = ""
+
     execution_max_attempts: int = Field(default=3, ge=1, le=10)
     execution_retry_base_seconds: float = Field(default=0.5, gt=0, le=30)
     execution_lease_seconds: float = Field(default=30, ge=1, le=300)

@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from alembic.util import CommandError
-from anyio import CapacityLimiter
+from anyio import CapacityLimiter, create_task_group
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
@@ -22,6 +22,8 @@ from app.extractions import router as extraction_router
 from app.operators import operator_credentials
 from app.qa_engine import QAEngine
 from app.reconciliations import router as reconciliation_router
+from app.slack.protocol import SlackConfig
+from app.slack.routes import router as slack_router, run_worker as run_slack_worker
 from app.source_storage import create_output_storage, create_source_storage
 from app.task_rules import router as task_rule_router
 from app.tasks import router as task_router
@@ -58,6 +60,11 @@ async def lifespan(app: FastAPI):
         logger.warning("Operator authentication unavailable: %s", error)
         app.state.operator_credentials = {}
     try:
+        app.state.slack_config = SlackConfig.load(settings, app.state.operator_credentials)
+    except ValueError as error:
+        logger.warning("%s", error)
+        app.state.slack_config = None
+    try:
         app.state.source_storage = create_source_storage(settings)
     except ValueError:
         logger.warning("Source storage configuration is invalid")
@@ -66,7 +73,15 @@ async def lifespan(app: FastAPI):
     except ValueError:
         logger.warning("Workbook storage configuration is invalid")
     try:
-        yield
+        if app.state.slack_config is None:
+            yield
+        else:
+            async with create_task_group() as workers:
+                workers.start_soon(run_slack_worker, app, app.state.slack_config)
+                try:
+                    yield
+                finally:
+                    workers.cancel_scope.cancel()
     finally:
         await app.state.extraction_source_reader.close()
         await app.state.storage_worker.close()
@@ -95,6 +110,7 @@ app.include_router(classification_router)
 app.include_router(allocation_router)
 app.include_router(workbook_router)
 app.include_router(delivery_router)
+app.include_router(slack_router)
 
 origins = [
     origin.strip()
