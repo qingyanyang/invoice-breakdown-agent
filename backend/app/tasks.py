@@ -13,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.config import settings
+from app.delivery_guard import guard_delivery_inputs
 from app.execution import (
     ExecutionFailure, acquire, claim, executing, fence, object_may_be_discarded,
     register_object, settle, transaction, write_registered_object,
@@ -145,6 +146,7 @@ async def lock_current_revision(
 
 
 async def append_revision(connection: AsyncConnection, current, changes: dict) -> TaskDetails:
+    await guard_delivery_inputs(connection, current["task_id"])
     next_revision = dict(current)
     operation = next_revision.pop("operation")
     next_revision.pop("created_at")

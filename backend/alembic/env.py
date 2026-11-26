@@ -6,6 +6,7 @@ from sqlalchemy.schema import CreateSchema
 from app import allocation_tables, classification_tables, execution_tables, extraction_tables, qa_tables, reconciliation_tables, task_tables, workbook_tables, workflow_tables
 from app.config import settings
 from app.database import create_database_engine, metadata
+from app.slack import tables as slack_tables
 
 schema = settings.postgres_schema
 

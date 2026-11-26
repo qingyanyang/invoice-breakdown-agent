@@ -657,3 +657,82 @@ test-only record. Keep the Supabase URL in `DATABASE_URL` for development.
 ## Deployment
 
 The existing backend workflow publishes the `knowledge-intelligence-api` image to GHCR and checks `/health` on Azure Container Apps. See the [infrastructure guide](../infra/README.md) for configuration.
+
+## Slack DM demo
+
+Issue #14 supports private one-to-one conversations with the bot in a single
+test workspace. Use synthetic workbooks only. The adapter accepts an uploaded
+workbook only when its SHA-256 is in the configured demo allowlist. The Slack
+app uses existing operator identities and the same task ownership, revision,
+and QA checks as the HTTP API.
+
+### Test workspace setup
+
+1. Run the backend with its existing database, checkpoint, source storage,
+   classification, and QA worker settings. Apply `alembic upgrade head`
+   and initialize LangGraph checkpoints as documented above.
+2. Create a Slack app in the test workspace. Enable its App Home Messages
+   tab for sending messages, and give its bot these scopes:
+   `chat:write`, `im:history`, `im:read`, `files:read`, and `files:write`.
+   Install it in the test workspace. Reinstall after changing scopes.
+3. Supply `SLACK_ENABLED=true`, `SLACK_TEAM_ID`, `SLACK_APP_ID`,
+   `SLACK_SIGNING_SECRET`, and `SLACK_BOT_TOKEN` through private
+   environment or deployment settings. Set `SLACK_OPERATOR_MAP` to a JSON
+   object such as `{"U0123456789":"operator-a"}`. Each Slack user maps to a
+   distinct existing name in `OPERATOR_TOKENS`.
+4. Set `SLACK_DEMO_SOURCE_SHA256` to a space-separated list of approved
+   synthetic workbook checksums. For example, from the repository root run
+   `shasum -a 256 tests/fixtures/invoice_breakdown/reconciliation.xlsx`
+   and use the checksum column. Verify that the test deployment starts with
+   the configured bot token and workspace.
+5. Enable Event Subscriptions with the bot event `message.im`. Set the
+   request URL to the deployed HTTPS endpoint `/integrations/slack/events`.
+   Enable Interactivity and use the same HTTPS endpoint as its request URL.
+   Slack signs both event and button requests with the app signing secret.
+
+### Run a synthetic workspace test
+
+1. Open the bot's Messages tab. Upload one allowlisted `.xlsx` in a new
+   DM message. Leave the caption blank for a no-target run, or enter
+   `breakdown target 282.54` to exercise GST clarification. Use
+   `breakdown target 282.54 ex_gst` when the basis is known.
+2. Answer using the buttons in that upload's thread. A question that
+   requires supporting context provides an `answer <control> <reason>`
+   reply format in the same thread.
+3. When automated QA passes, open the complete QA preview PDF. Review the
+   listed pages for every worksheet and record each worksheet's outcome
+   using its buttons. Test that a duplicate click or a reply in another
+   thread cannot advance the task.
+4. Confirm that final delivery appears in the original thread after every
+   required check and approval. Download the workbook and compare its
+   `shasum -a 256` with the candidate checksum in the owner QA response.
+   Check the Chinese summary and verify the final reconciliation difference.
+5. When the bot reports a retryable failure or `delivery_unknown`, send
+   `retry` in the original upload thread. A task waiting on its first
+   source resumes with the original attachment and upload receipt.
+   For `delivery_unknown`, the adapter checks the stored
+   Slack file ID. If its destination and share remain unconfirmed, ask the
+   test workspace administrator to inspect that original upload.
+
+Delivery of previews and verified workbooks is limited to the authenticated
+requester in the original DM thread. Group messages and external workspaces
+are excluded. Slack is disabled by default. The app stores normalized
+events, thread bindings, review controls, and file IDs in PostgreSQL. One
+worker per deployment processes events across replicas. PostgreSQL
+serializes the worker while workflow stages run outside the inbox
+transaction. Core HTTP 202 and Slack rate limits defer the event according
+to `Retry-After`, within a 30-minute deferral window. An explicit Slack
+429 during completion schedules another completion using the same file
+ID. A lost response leaves the receipt at `delivery_unknown` until Slack
+confirms the original share. During final dispatch, a short database
+session lock protects the approved revision and QA inputs. A competing
+task change can be retried after dispatch finishes. Set up access to the
+test database and Slack workspace
+according to their synthetic data retention policies.
+
+Run the automated tests with
+`pytest tests/test_slack_dm.py` from `backend` using disposable PostgreSQL.
+The Slack HTTP responses and model proposal are mocked. The end-to-end
+test also uses the repository's isolated LibreOffice QA worker fixture.
+Those tests exercise a different boundary from the live Slack workspace
+test above.
