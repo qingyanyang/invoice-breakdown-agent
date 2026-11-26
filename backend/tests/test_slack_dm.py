@@ -1,20 +1,23 @@
 import hashlib
 import hmac
 import json
+from asyncio import Event, create_task
 from io import BytesIO
 from time import time
 from urllib.parse import parse_qs, urlencode
 
 import httpx
 import pytest
-from anyio import sleep_forever
+from anyio import fail_after, sleep_forever
 from pydantic import SecretStr
 from pypdf import PdfWriter
 from sqlalchemy import func, select, update
 
-from app import classification_model, main
+from app import classification_model, main, workflows
 from app.checkpoints import setup_checkpoints
 from app.config import settings
+from app.execution import ExecutionFailure
+from app.execution_tables import execution_runs
 from app.slack import routes, store
 from app.slack.core import Core
 from app.slack.protocol import SlackClient, SlackError
@@ -337,7 +340,7 @@ def test_multi_page_visual_control_requires_complete_preview_coverage():
         preview_sheets(coverage, output.getvalue())
 
 
-def intercept_core(monkeypatch, hook):
+def intercept_core(monkeypatch, hook, *, observe=None):
     class InterceptedCore(Core):
         def __init__(self, app, operator):
             super().__init__(app, operator)
@@ -345,7 +348,11 @@ def intercept_core(monkeypatch, hook):
 
             async def request(method, path, **kwargs):
                 response = await hook(method, path, kwargs)
-                return response if response is not None else await original(method, path, **kwargs)
+                if response is None:
+                    response = await original(method, path, **kwargs)
+                if observe is not None:
+                    observe(method, path, kwargs, response)
+                return response
 
             self.client.request = request
 
@@ -412,37 +419,96 @@ async def test_final_share_is_serialized_with_task_revision_changes(
             assert success(await client.put(path + "/target", json=payload, headers=ALICE))["revision"] == 3
 
 
+def ambiguous_totals_source(workbook_with):
+    return workbook_with({WORKSHEET: source_sheet([
+        ("Base work", "75", None),
+        ("Sheet Total ex GST", "75", "D4"),
+        ("Option: Alternative Total", "90", "D4"),
+        ("Project Total ex GST", "75", "D4"),
+        ("Final Total ex GST", "75", "D4"),
+        ("Project Total incl GST", "82.50", "D4"),
+    ])})
+
+
 @pytest.mark.anyio
-async def test_core_accepted_status_defers_same_event_and_receipt_until_due(slack_demo, monkeypatch):
-    receipts = []
+@pytest.mark.parametrize("pending_status", ["running", "retryable"])
+async def test_real_core_202_defers_workflow_without_advancing_dependents(
+    slack_demo, monkeypatch, workbook_with, pending_status,
+):
+    sample = ambiguous_totals_source(workbook_with)
+    monkeypatch.setattr(settings, "slack_demo_source_sha256", hashlib.sha256(sample).hexdigest())
+    monkeypatch.setattr(settings, "execution_duplicate_wait_seconds", 0)
+    monkeypatch.setattr(settings, "execution_retry_base_seconds", 17)
+    entered, release = Event(), Event()
+    initialize = workflows.initialize_workflow
 
-    async def pending(method, path, kwargs):
-        if method == "POST" and path.endswith("/workflow"):
-            receipts.append(kwargs["headers"]["Idempotency-Key"])
-            if len(receipts) == 1:
-                return httpx.Response(
-                    202, headers={"Retry-After": "37"}, json={"detail": {"status": "running", "execution_id": "synthetic"}},
-                )
+    async def first_checkpoint(engine, revision, attempt):
+        if not entered.is_set():
+            entered.set()
+            if pending_status == "retryable":
+                raise ExecutionFailure(503, "Checkpoints temporarily unavailable", "checkpoint_unavailable", retryable=True)
+            await release.wait()
+        return await initialize(engine, revision, attempt)
 
-    intercept_core(monkeypatch, pending)
+    monkeypatch.setattr(workflows, "initialize_workflow", first_checkpoint)
     await setup_checkpoints(settings)
-    fake = FakeSlack(slack_demo)
-    async with service() as client:
-        await post_event(client, event("EvCorePending", file_id="FSOURCE", caption="breakdown target 282.54"))
-        await drain(fake)
-        queued, = await rows(inbox)
-        assert queued["state"] == "queued" and queued["error"] == "core_execution_pending"
-        assert queued["attempts"] == 0
-        assert (queued["available_at"] - queued["created_at"]).total_seconds() >= 37
-        assert fake.messages == [] and fake.staged == {}
-        await drain(fake)
-        assert len(receipts) == 1
+    fake = FakeSlack(sample)
+    contender = None
+    workflow_responses = []
+    extraction_requests = []
+
+    def observe(method, path, kwargs, response):
+        if method == "POST" and path.endswith("/workflow"):
+            workflow_responses.append((kwargs["headers"]["Idempotency-Key"], response))
+        if method == "POST" and path.endswith("/extraction"):
+            extraction_requests.append(path)
 
     async with service() as client:
+        async def start_competing_request(method, path, _kwargs):
+            nonlocal contender
+            if method == "POST" and path.endswith("/workflow") and contender is None:
+                contender = create_task(client.post(path, json={"expected_revision": 2}, headers=ALICE))
+                with fail_after(8):
+                    await entered.wait()
+                    if pending_status == "retryable":
+                        await contender
+
+        intercept_core(monkeypatch, start_competing_request, observe=observe)
+        try:
+            await post_event(client, event("EvCorePending", file_id="FSOURCE"))
+            await drain(fake)
+            (first_key, first), = workflow_responses
+            assert first.status_code == 202 and first.json()["detail"]["status"] == pending_status
+            run, = [row for row in await rows(execution_runs) if row["operation"] == "checkpoint_start"]
+            assert str(run["id"]) == first.json()["detail"]["execution_id"]
+            assert run["operation"] == "checkpoint_start" and run["status"] == pending_status
+            queued, = await rows(inbox)
+            assert queued["state"] == "queued" and queued["error"] == "core_execution_pending"
+            assert queued["attempts"] == 0
+            assert (queued["available_at"] - queued["created_at"]).total_seconds() >= int(first.headers["Retry-After"])
+            assert fake.messages == [] and fake.staged == {} and extraction_requests == []
+            await drain(fake)
+            assert len(workflow_responses) == 1 and extraction_requests == []
+        finally:
+            release.set()
+            if contender is not None:
+                with fail_after(8):
+                    competing_result = await contender
+        assert competing_result.status_code == (503 if pending_status == "retryable" else 200)
+
+    async with service() as client:
+        if pending_status == "retryable":
+            async with main.app.state.database_engine.begin() as connection:
+                await connection.execute(update(execution_runs).where(
+                    execution_runs.c.operation == "checkpoint_start",
+                ).values(retry_at=func.now()))
         await make_retries_due()
         await drain(fake)
-        assert len(receipts) == 2 and receipts[0] == receipts[1]
-        assert fake.button("ex_gst")
+        assert len(workflow_responses) == 2
+        second_key, second = workflow_responses[1]
+        assert second_key == first_key and success(second)["status"] == "ready_for_extraction"
+        assert len(extraction_requests) == 1
+        assert fake.button("Trade Summary!D7")
         done, = await rows(inbox)
         assert done["state"] == "done"
         assert len(await rows(tasks)) == 1
@@ -484,14 +550,7 @@ async def test_pending_upload_reuses_bound_source_event_and_core_receipt(slack_d
 async def test_reconciliation_question_shows_nested_candidate_evidence_and_accepts_original_option(
     slack_demo, configured_skill, monkeypatch, workbook_with,
 ):
-    sample = workbook_with({WORKSHEET: source_sheet([
-        ("Base work", "75", None),
-        ("Sheet Total ex GST", "75", "D4"),
-        ("Option: Alternative Total", "90", "D4"),
-        ("Project Total ex GST", "75", "D4"),
-        ("Final Total ex GST", "75", "D4"),
-        ("Project Total incl GST", "82.50", "D4"),
-    ])})
+    sample = ambiguous_totals_source(workbook_with)
     monkeypatch.setattr(settings, "slack_demo_source_sha256", hashlib.sha256(sample).hexdigest())
     await setup_checkpoints(settings)
     fake = FakeSlack(sample)
